@@ -4,6 +4,7 @@
 支持：
 1) RF 融合回测
 2) 网格搜索后自动回写 config.py 最优参数
+3) 仅当优于当前参数时才回写（保护开关）
 """
 import os
 import re
@@ -13,7 +14,7 @@ import itertools
 
 from loguru import logger
 
-from config import name_path, data_file_name, plus_strategy, rf_args
+from config import name_path, data_file_name, plus_strategy
 from feature_engineering import load_dlt_history
 from inference_plus import build_ensemble_scores, generate_front_combos, maybe_load_rf_model
 
@@ -67,7 +68,6 @@ def run_backtest_core(
     old_weights = strategy["ensemble_weights"].copy()
     old_rule_filters = strategy["rule_filters"].copy()
 
-    # 临时覆写，复用 inference_plus 逻辑
     strategy["top_n_front"] = int(top_n_front)
     strategy["max_front_combos"] = int(max_front_combos)
     strategy["ensemble_weights"] = ensemble_weights
@@ -128,7 +128,7 @@ def run_backtest_core(
         strategy["rule_filters"] = old_rule_filters
 
     hit3_count = sum(1 for r in records if r["best_front_hit"] >= 3)
-    ret = {
+    return {
         "periods": len(records),
         "total_cost": int(total_cost),
         "total_reward": int(total_reward),
@@ -137,14 +137,11 @@ def run_backtest_core(
         "hit3_or_more_rate": float(hit3_count / len(records)) if records else 0.0,
         "records": records,
     }
-    return ret
 
 
 def run_grid_search(data_asc, start_idx, end_idx, base_strategy, rf_model=None, rf_meta=None):
     top_n_list = [8, 9, 10]
     play_front_list = [1, 2]
-
-    # use_rf=True 时，让网格支持 rf 权重；否则会自动以 0 占位
     weight_list = [
         {"lstm": 0.30, "rf": 0.50, "stat": 0.20},
         {"lstm": 0.35, "rf": 0.45, "stat": 0.20},
@@ -177,19 +174,16 @@ def run_grid_search(data_asc, start_idx, end_idx, base_strategy, rf_model=None, 
             "hit3_or_more_rate": r["hit3_or_more_rate"],
         })
 
-    results = sorted(results, key=lambda x: (x["profit"], x["roi"]), reverse=True)
-    return results
+    return sorted(results, key=lambda x: (x["profit"], x["roi"]), reverse=True)
 
 
 def apply_best_params_to_config(config_path, best):
-    """将网格搜索最优参数回写到 config.py（只改3处：top_n_front / play_front_combos / ensemble_weights）。"""
     if not os.path.exists(config_path):
         raise Exception("config.py 不存在: {}".format(config_path))
 
     with open(config_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # 只替换首个匹配，避免误改其它位置
     content, n1 = re.subn(r'("top_n_front"\s*:\s*)\d+', r'\g<1>{}'.format(int(best["top_n_front"])), content, count=1)
     content, n2 = re.subn(r'("play_front_combos"\s*:\s*)\d+', r'\g<1>{}'.format(int(best["play_front_combos"])), content, count=1)
 
@@ -205,9 +199,47 @@ def apply_best_params_to_config(config_path, best):
         f.write(content)
 
 
+def extract_current_params_for_guard(config_path):
+    with open(config_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    def _search(pattern, cast=float, default=None):
+        m = re.search(pattern, content)
+        if not m:
+            return default
+        return cast(m.group(1))
+
+    return {
+        "top_n_front": _search(r'"top_n_front"\s*:\s*(\d+)', int),
+        "play_front_combos": _search(r'"play_front_combos"\s*:\s*(\d+)', int),
+        "weights": {
+            "lstm": _search(r'"lstm"\s*:\s*([0-9.]+)', float),
+            "rf": _search(r'"rf"\s*:\s*([0-9.]+)', float),
+            "stat": _search(r'"stat"\s*:\s*([0-9.]+)', float),
+        }
+    }
+
+
+def pick_result_by_params(grid_results, params):
+    for item in grid_results:
+        if int(item["top_n_front"]) != int(params["top_n_front"]):
+            continue
+        if int(item["play_front_combos"]) != int(params["play_front_combos"]):
+            continue
+        w = item["weights"]
+        if (
+            abs(float(w["lstm"]) - float(params["weights"]["lstm"])) < 1e-9
+            and abs(float(w["rf"]) - float(params["weights"]["rf"])) < 1e-9
+            and abs(float(w["stat"]) - float(params["weights"]["stat"])) < 1e-9
+        ):
+            return item
+    return None
+
+
 def save_grid_results(results, out_path):
-    if not os.path.exists(os.path.dirname(out_path)):
-        os.makedirs(os.path.dirname(out_path))
+    out_dir = os.path.dirname(out_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
@@ -215,11 +247,12 @@ def save_grid_results(results, out_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", default="dlt", type=str)
-    parser.add_argument("--start_offset", default=200, type=int, help="从倒数多少期开始回测")
+    parser.add_argument("--start_offset", default=200, type=int)
     parser.add_argument("--run_grid", default=1, type=int)
-    parser.add_argument("--use_rf", default=1, type=int, help="是否在回测中启用RF融合")
-    parser.add_argument("--auto_apply_best", default=0, type=int, help="是否自动把网格最优参数写回config.py")
-    parser.add_argument("--save_grid", default=1, type=int, help="是否保存网格搜索结果到outputs目录")
+    parser.add_argument("--use_rf", default=1, type=int)
+    parser.add_argument("--auto_apply_best", default=0, type=int)
+    parser.add_argument("--apply_only_if_better", default=1, type=int, help="仅当网格最优优于当前参数时才回写")
+    parser.add_argument("--save_grid", default=1, type=int)
     args = parser.parse_args()
 
     if args.name != "dlt":
@@ -271,8 +304,22 @@ def main():
 
         if int(args.auto_apply_best) == 1:
             config_path = os.path.join(os.getcwd(), "config.py")
-            apply_best_params_to_config(config_path, best)
-            logger.info("最优参数已回写到 config.py")
+            do_apply = True
+            if int(args.apply_only_if_better) == 1:
+                current_params = extract_current_params_for_guard(config_path)
+                current_item = pick_result_by_params(gs, current_params)
+                if current_item is None:
+                    logger.warning("未在网格结果中找到当前参数组合，默认允许回写")
+                else:
+                    if best["profit"] <= current_item["profit"]:
+                        do_apply = False
+                        logger.info("保护开关生效：网格最优未优于当前参数，跳过回写")
+                    else:
+                        logger.info("保护开关生效：网格最优优于当前参数，允许回写")
+
+            if do_apply:
+                apply_best_params_to_config(config_path, best)
+                logger.info("最优参数已回写到 config.py")
 
 
 if __name__ == "__main__":

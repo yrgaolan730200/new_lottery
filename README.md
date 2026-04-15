@@ -11,6 +11,7 @@
 - 后区固定执行 **1~12 全包（66 注）**
 - 支持 **LSTM + RF + 统计特征** 融合评分
 - 支持 **历史滚动回测 + 网格调参 + 最优参数自动回写 config.py**
+- 新增 **Streamlit Web 页面**，可视化操作全流程
 
 ---
 
@@ -23,30 +24,28 @@
 - `run_train_rf_model.py`：前区 RF 训练脚本
 - `inference_plus.py`：5+12 推理脚本（融合评分 + 组合过滤 + 注单导出）
 - `backtest_plus.py`：5+12 回测与网格搜索脚本（支持自动回写最优参数）
+- `app_streamlit.py`：Streamlit Web 应用入口
 - `config.py`：统一参数配置
 
 ---
 
 ## 3. 环境安装
 
-建议 Python 3.9~3.11（Windows / Linux 都可）。
+建议 Python 3.8（你当前 `lottery` 环境就是 3.8.20）。
 
 ```bash
 pip install -r requirements.txt
 ```
 
-如果你只想跑新策略，至少需要这些关键依赖：
+如果 `scikit-learn==1.5.2` 在你的环境安装失败，可改用：
 
-- `pandas`
-- `numpy`
-- `scikit-learn`
-- `loguru`
-
-> 注：原始 LSTM 相关功能依赖 TensorFlow 及 `tensorflow-addons`，请按 `requirements.txt` 安装。
+```bash
+conda install -c conda-forge scikit-learn=1.3.2 -y
+```
 
 ---
 
-## 4. 快速开始（推荐顺序）
+## 4. 命令行运行流程（CLI）
 
 ### 第一步：抓取大乐透数据
 
@@ -56,20 +55,11 @@ python get_data.py --name dlt
 
 输出数据文件：`data/dlt/data.csv`
 
----
-
 ### 第二步：训练原始 LSTM 模型（可选但推荐）
 
 ```bash
 python run_train_model.py --name dlt --train_test_split 0.8
 ```
-
-模型输出目录：
-
-- `model/dlt/red_ball_model/`
-- `model/dlt/blue_ball_model/`
-
----
 
 ### 第三步：训练 RF 前区模型
 
@@ -77,12 +67,10 @@ python run_train_model.py --name dlt --train_test_split 0.8
 python run_train_rf_model.py --name dlt --train_test_split 0.8 --min_history 120
 ```
 
-模型输出：
+输出：
 
 - `model/dlt/rf_front_model.pkl`
 - `model/dlt/rf_front_meta.json`
-
----
 
 ### 第四步：执行 5+12 推理
 
@@ -90,98 +78,71 @@ python run_train_rf_model.py --name dlt --train_test_split 0.8 --min_history 120
 python inference_plus.py --name dlt --use_lstm 1 --use_rf 1 --save 1
 ```
 
-说明：
-
-- `--use_lstm 1`：启用 LSTM 代理分
-- `--use_rf 1`：启用 RF 分
-- `--save 1`：保存结果文件
-
-输出文件（`outputs/`）：
+输出（`outputs/`）：
 
 - `inference_plus_<期号>.json`
 - `front_combos_<期号>.csv`
 - `tickets_<期号>.csv`
 
-其中 `tickets_<期号>.csv` 为最佳前区组合对应的后区全包注单（66 注，132 元）。
-
----
-
-### 第五步：执行回测 + 网格调参
+### 第五步：回测 + 网格
 
 ```bash
 python backtest_plus.py --name dlt --start_offset 200 --run_grid 1 --use_rf 1 --save_grid 1
 ```
 
-参数说明：
-
-- `--start_offset`：从最近多少期开始回测
-- `--run_grid 1`：开启网格搜索
-- `--use_rf 1`：回测时启用 RF 融合
-- `--save_grid 1`：保存网格结果到 `outputs/backtest_grid_results.json`
-
----
-
-### 第六步：自动回写最优参数到 `config.py`
+### 第六步：自动回写最优参数（带保护开关）
 
 ```bash
-python backtest_plus.py --name dlt --start_offset 200 --run_grid 1 --use_rf 1 --auto_apply_best 1
+python backtest_plus.py --name dlt --start_offset 200 --run_grid 1 --use_rf 1 --auto_apply_best 1 --apply_only_if_better 1
 ```
 
-会自动把网格最优参数写回：
-
-- `plus_strategy["dlt"]["top_n_front"]`
-- `plus_strategy["dlt"]["play_front_combos"]`
-- `plus_strategy["dlt"]["ensemble_weights"]`
+含义：仅当网格最优 `profit` 优于当前配置时才回写 `config.py`。
 
 ---
 
-## 5. 配置说明（`config.py`）
+## 5. Web 版运行流程（Streamlit）
 
-主要关注：`plus_strategy["dlt"]`
+### 5.1 启动
+
+```bash
+streamlit run app_streamlit.py
+```
+
+浏览器会自动打开（默认 `http://localhost:8501`）。
+
+### 5.2 页面功能
+
+- **数据更新**：一键执行 `get_data.py --name dlt`
+- **模型训练**：
+  - 训练 LSTM
+  - 训练 RF
+- **5+12预测**：
+  - 勾选是否启用 LSTM/RF
+  - 展示目标期号、Top候选、最佳前区5码、总注数和成本
+  - 展示注单明细
+- **回测调参**：
+  - 设置回测窗口
+  - 启用/关闭 RF
+  - 网格搜索
+  - 自动回写最优参数
+  - 仅优于当前参数才回写（保护开关）
+
+---
+
+## 6. 配置说明（`config.py`）
+
+主要看 `plus_strategy["dlt"]`：
 
 - `top_n_front`：前区候选池大小（建议 8~10）
-- `max_front_combos`：候选前区组合排名保留上限
-- `play_front_combos`：每期实际下注前区组合数（每组配 66 注后区）
+- `max_front_combos`：候选组合保留上限
+- `play_front_combos`：每期实际下注的前区组合数
 - `rule_filters`：组合过滤规则
-- `score_windows`：统计特征窗口（短/中/长）
+- `score_windows`：统计特征窗口
 - `ensemble_weights`：融合权重（`lstm/rf/stat`）
-- `payouts`：3+2 / 3+1 / 3+0 奖金近似（用于策略收益估算）
-
-RF 参数位于：`rf_args["dlt"]`
+- `payouts`：3+2 / 3+1 / 3+0 奖金近似
 
 ---
 
-## 6. 融合策略逻辑
-
-在 `inference_plus.py` 中，每个前区号码（1~35）得到三类分数：
-
-1. `lstm`：LSTM 5 码预测映射成 35 维代理分
-2. `rf`：RF 对每个号码是否出现的概率分
-3. `stat`：基于频次、遗漏、窗口统计的分数
-
-最终融合：
-
-\[
-score = w_{lstm} \cdot s_{lstm} + w_{rf} \cdot s_{rf} + w_{stat} \cdot s_{stat}
-\]
-
-然后取 Top-N，组合成前区 5 码并过滤。
-
----
-
-## 7. 常见问题
-
-### Q1：为什么回测收益可能为负？
-彩票本质是高随机过程，历史拟合不代表未来收益，负收益是常见情况。
-
-### Q2：没有 RF 模型能否运行？
-可以。`inference_plus.py` 在找不到 RF 模型时会自动退化为 LSTM+统计分。
-
-### Q3：双色球是否支持新策略脚本？
-目前 `inference_plus.py` 与 `backtest_plus.py` 仅支持 `dlt`。
-
----
-
-## 8. 免责声明
+## 7. 免责声明
 
 本仓库仅用于技术研究与学习交流，不构成任何投资/投注建议。请遵守当地法律法规，理性参与。
