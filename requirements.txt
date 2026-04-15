@@ -9,3 +9,4 @@ lxml==4.6.2
 loguru==0.6.0
 grpcio==1.46.0
 protobuf==3.18.1
+scikit-learn==1.5.2
