@@ -28,23 +28,45 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .main {
-        background: radial-gradient(circle at top right, #111827 0%, #0b1020 45%, #05070f 100%);
-        color: #f5f7ff;
+    .stApp {
+        background: linear-gradient(180deg, #f7f9ff 0%, #eef3ff 100%);
+        color: #0f172a;
     }
-    .stApp h1, .stApp h2, .stApp h3 {
-        color: #e7ebff;
-        letter-spacing: 0.3px;
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4 {
+        color: #0b1f5e;
+        letter-spacing: 0.2px;
     }
-    .metric-card {
-        border-radius: 14px;
-        padding: 14px 18px;
-        background: linear-gradient(135deg, rgba(23,32,64,0.85), rgba(14,20,40,0.85));
-        border: 1px solid rgba(109,130,255,0.28);
+    .stMarkdown, .stText, .stCaption, .stMetricLabel, .stMetricValue {
+        color: #0f172a !important;
+    }
+    .block-container {
+        padding-top: 1.6rem;
+        padding-bottom: 1.5rem;
+    }
+    [data-testid="stSidebar"] {
+        background: #ffffff;
+        border-right: 1px solid #d7def5;
+    }
+    [data-testid="stSidebar"] * {
+        color: #0f172a !important;
+    }
+    .note-card {
+        border-radius: 12px;
+        padding: 14px 16px;
+        background: #ffffff;
+        border: 1px solid #dbe4ff;
+        color: #0f172a;
     }
     .small-note {
-        color: #9fb0ff;
-        font-size: 0.88rem;
+        color: #334155;
+        font-size: 0.9rem;
+    }
+    .rule-card {
+        border-radius: 12px;
+        padding: 12px 14px;
+        background: #ffffff;
+        border: 1px solid #dbe4ff;
+        margin-bottom: 10px;
     }
     </style>
     """,
@@ -106,7 +128,7 @@ def load_latest_tickets_csv(issue):
 
 with st.sidebar:
     st.subheader("⚙️ 快速导航")
-    st.markdown("- 数据更新\n- 模型训练\n- 5+12预测\n- 回测调参")
+    st.markdown("- 规则与功能介绍\n- 数据更新\n- 模型训练\n- 5+12预测\n- 回测调参")
 
     st.markdown("---")
     st.subheader("🚀 启动方式")
@@ -114,19 +136,77 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown(
-        "<div class='small-note'>"
-        "提示：若首次运行较慢，通常是 TensorFlow/模型加载耗时。"
-        "</div>",
+        "<div class='note-card'>"
+        "<div class='small-note'><b>提示</b><br/>"
+        "首次运行较慢通常是 TensorFlow 加载模型导致，属于正常现象。"
+        "</div></div>",
         unsafe_allow_html=True,
     )
 
 
-tab_data, tab_train, tab_infer, tab_backtest = st.tabs([
+tab_intro, tab_data, tab_train, tab_infer, tab_backtest = st.tabs([
+    "📘 规则与功能介绍",
     "📥 数据更新",
     "🧠 模型训练",
     "🔮 5+12预测",
     "📈 回测调参",
 ])
+
+
+with tab_intro:
+    st.subheader("规则与功能介绍")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("### 🎯 玩法规则（本系统关注）")
+        st.markdown(
+            """
+            <div class='rule-card'>
+            <b>前区</b>：从 1~35 中选 5 个号码
+            </div>
+            <div class='rule-card'>
+            <b>后区</b>：从 1~12 中选 2 个号码
+            </div>
+            <div class='rule-card'>
+            <b>5+12策略</b>：前区给出 1 组或多组 5 码，后区执行 1~12 全包（共 66 注，132 元）
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("### 🧠 预测核心逻辑")
+        st.markdown(
+            """
+            - `LSTM`：学习近期时序模式（代理打分）
+            - `RF`：基于统计特征输出每个前区号码出现概率
+            - `Stat`：频次/遗漏/窗口统计分
+            - 融合公式：`score = w_lstm*s_lstm + w_rf*s_rf + w_stat*s_stat`
+            """
+        )
+
+    with c2:
+        st.markdown("### 🔧 功能模块说明")
+        st.markdown(
+            """
+            - **数据更新**：抓取最新大乐透历史开奖
+            - **模型训练**：训练 LSTM 和 RF
+            - **5+12预测**：生成 Top-N 候选、最佳前区组合与注单
+            - **回测调参**：滚动回测、网格搜索、自动回写参数
+            """
+        )
+
+        st.markdown("### 🛡️ 安全保护（参数回写）")
+        st.markdown(
+            """
+            当启用“自动回写最优参数”时，可同时打开：
+            - **仅当优于当前参数才回写**
+
+            含义：只有网格最优参数的 `profit` 严格优于当前配置，才会写回 `config.py`，避免误覆盖。
+            """
+        )
+
+    st.info("本平台用于策略研究与回测分析，不构成任何投资/购彩建议。")
 
 
 with tab_data:
@@ -213,7 +293,7 @@ with tab_infer:
             st.json(top10)
 
         issue = infer_data.get("next_issue")
-        ticket_path, ticket_df = load_latest_tickets_csv(issue)
+        _, ticket_df = load_latest_tickets_csv(issue)
         if ticket_df is not None:
             st.markdown("### 注单明细（最佳前区 + 后区全包）")
             st.dataframe(ticket_df, use_container_width=True, height=320)
