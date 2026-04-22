@@ -1,13 +1,19 @@
+# Core ML stack (TensorFlow 2.6 compatible)
 tensorflow-cpu==2.6.1
-tensorflow-addons==0.10.0
-requests==2.22.0
 keras==2.6.0
-beautifulsoup4==4.9.3
-pandas==1.0.0
-numpy==1.19.5
-lxml==4.6.2
-loguru==0.6.0
+tensorflow-estimator==2.6.0
+tensorflow-addons==0.16.1
+protobuf==3.20.3
 grpcio==1.46.0
-protobuf==3.18.1
-scikit-learn==1.5.2
-streamlit==1.37.1
+numpy==1.19.5
+
+# Data & parsing
+pandas==1.3.5
+scikit-learn==1.1.3
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==4.9.4
+loguru==0.7.2
+
+# UI
+streamlit==1.25.0

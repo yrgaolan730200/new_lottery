@@ -8,6 +8,7 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from loguru import logger
+from requests.exceptions import ProxyError, RequestException
 from config import os, name_path, data_file_name
 
 parser = argparse.ArgumentParser()
@@ -25,12 +26,34 @@ def get_url(name):
     return url, path
 
 
+def fetch_url(url, timeout=20):
+    """请求页面：优先默认网络配置；代理异常时自动绕过系统代理重试。"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        )
+    }
+
+    try:
+        return requests.get(url=url, headers=headers, verify=False, timeout=timeout)
+    except ProxyError as e:
+        logger.warning("检测到代理连接异常，尝试直连：{}", e)
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.get(url=url, headers=headers, verify=False, timeout=timeout)
+    except RequestException as e:
+        logger.error("请求失败：{}", e)
+        raise
+
+
 def get_current_number(name):
     """ 获取最新一期数字
     :return: int
     """
     url, _ = get_url(name)
-    r = requests.get("{}{}".format(url, "history.shtml"), verify=False)
+    r = fetch_url("{}{}".format(url, "history.shtml"))
     r.encoding = "gb2312"
     soup = BeautifulSoup(r.text, "lxml")
     current_num = soup.find("div", class_="wrap_datachart").find("input", id="end")["value"]
@@ -47,7 +70,7 @@ def spider(name, start, end, mode):
     """
     url, path = get_url(name)
     url = "{}{}{}".format(url, path.format(start), end)
-    r = requests.get(url=url, verify=False)
+    r = fetch_url(url)
     r.encoding = "gb2312"
     soup = BeautifulSoup(r.text, "lxml")
     trs = soup.find("tbody", attrs={"id": "tdata"}).find_all("tr")
