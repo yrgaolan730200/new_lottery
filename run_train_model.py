@@ -20,10 +20,18 @@ pred_key = {}
 
 
 def create_data(data, name, windows):
-    """ 创建训练数据
-    :param data: 数据集
+    """ 创建训练数据（时序方向：过去→未来）
+
+    数据必须按期号升序排列（旧→新）。
+    对每个窗口位置 i：
+      x = data[i : i+windows]        ← 连续 windows 期历史
+      y = data[i+windows]            ← 紧接着的下一期（预测目标）
+
+    保证：x 包含的期号全部严格早于 y 的期号，杜绝时间泄漏。
+
+    :param data: 数据集（已按期号升序排列）
     :param name: 玩法，双色球/大乐透
-    :param windows: 训练窗口
+    :param windows: 训练窗口大小
     :return:
     """
     if not len(data):
@@ -37,10 +45,12 @@ def create_data(data, name, windows):
     data = data.iloc[:, 2:].values
     logger.info("训练集数据维度: {}".format(data.shape))
     x_data, y_data = [], []
-    for i in range(len(data) - windows - 1):
+    # 时序构造：过去 windows 期 → 下一期
+    # data 按期号升序（旧→新），i 越大期号越新
+    for i in range(len(data) - windows):
         sub_data = data[i:(i+windows+1), :]
-        x_data.append(sub_data[1:])
-        y_data.append(sub_data[0])
+        x_data.append(sub_data[:windows])   # 第 i 到 i+windows-1 期（过去）
+        y_data.append(sub_data[windows])    # 第 i+windows 期（紧接的下一期）
 
     cut_num = 6 if name == "ssq" else 5
     return {
@@ -54,12 +64,19 @@ def create_data(data, name, windows):
 
 
 def create_train_test_data(name, windows, train_test_split):
-    """ 划分数据集 """
+    """ 划分数据集（时序切分：前 train_test_split 比例用于训练，之后用于测试） """
     if train_test_split < 0.5:
         raise "训练集采样比例小于50%,训练终止,请求重新采样（train_test_split>0.5）!"
     path = "{}{}".format(name_path[name]["path"], data_file_name)
     data = pd.read_csv(path)
+    # 统一排序规范：按期号升序（旧→新），确保 create_data 的时序构造正确
+    if "期数" in data.columns:
+        data["期数"] = data["期数"].astype(int)
+        data = data.sort_values("期数").reset_index(drop=True)
     logger.info("read data from path: {}".format(path))
+    logger.info("数据期号范围: {} → {}（升序: 旧→新）".format(
+        int(data["期数"].iloc[0]), int(data["期数"].iloc[-1])))
+    # 时序切分：早期数据用于训练，晚期数据用于测试
     train_data = create_data(data.iloc[:int(len(data) * train_test_split)], name, windows)
     test_data = create_data(data.iloc[int(len(data) * train_test_split):], name, windows)
     logger.info(
