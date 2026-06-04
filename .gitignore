@@ -38,5 +38,9 @@ Thumbs.db
 data/
 model/
 
+# Project outputs (backtest reports, grid results, inference outputs)
+outputs/*.csv
+outputs/*.json
+
 # If you later want to version small sample data, put it under: data_sample/
 # and add a rule like: !data_sample/

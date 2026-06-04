@@ -95,8 +95,12 @@ def spider(name, start, end, mode):
 
     if mode == "train":
         df = pd.DataFrame(data)
+        # 统一排序规范：按期号升序（旧→新），确保下游消费者排序一致
+        if "期数" in df.columns:
+            df["期数"] = df["期数"].astype(int)
+            df = df.sort_values("期数").reset_index(drop=True)
         df.to_csv("{}{}".format(name_path[name]["path"], data_file_name), encoding="utf-8")
-        return pd.DataFrame(data)
+        return df
     elif mode == "predict":
         return pd.DataFrame(data)
 

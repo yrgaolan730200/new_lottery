@@ -17,6 +17,7 @@ from feature_engineering import (
     calc_stat_scores,
     build_lstm_proxy_scores,
     build_feature_for_next_issue,
+    load_dlt_history,
 )
 
 
@@ -32,17 +33,18 @@ def _load_lstm_predict_funcs():
     return rp.load_model, rp.get_final_result
 
 
-def load_local_dlt_data_desc():
-    path = "{}{}".format(name_path["dlt"]["path"], data_file_name)
-    if not os.path.exists(path):
-        raise Exception("未找到大乐透历史数据，请先执行 get_data.py --name dlt")
-    data = pd.read_csv(path)
-    for c in ["红球_1", "红球_2", "红球_3", "红球_4", "红球_5", "蓝球_1", "蓝球_2"]:
-        data[c] = data[c].astype(int)
-    data["期数"] = data["期数"].astype(int)
-    # 保持与 run_predict.py 一致：降序（最近一期在前）
-    data = data.sort_values("期数", ascending=False).reset_index(drop=True)
-    return data
+def load_local_dlt_data():
+    """加载大乐透历史数据，返回 (升序, 降序) 两个视图。
+
+    升序（旧→新）：用于 RF/统计特征构建、LSTM 预测输入
+                  与 feature_engineering 和 run_train_model 约定一致
+    降序（新→旧）：用于获取最新期号、上期前区集合等便捷查询
+    """
+    data_asc = load_dlt_history(
+        "{}{}".format(name_path["dlt"]["path"], data_file_name)
+    )
+    data_desc = data_asc.iloc[::-1].reset_index(drop=True)
+    return data_asc, data_desc
 
 
 def extract_front_nums_from_pred(pred_d):
@@ -173,9 +175,8 @@ def generate_5_plus_12_tickets(front_combo):
 
 
 def infer_next_issue(use_lstm=True, use_rf=True):
-    # 历史数据
-    data_desc = load_local_dlt_data_desc()
-    data_asc = data_desc.sort_values("期数").reset_index(drop=True)
+    # 统一数据加载：data_asc=升序（旧→新），data_desc=降序（新→旧）
+    data_asc, data_desc = load_local_dlt_data()
 
     latest_issue = int(data_desc.iloc[0]["期数"])
     next_issue = latest_issue + 1
@@ -189,10 +190,25 @@ def infer_next_issue(use_lstm=True, use_rf=True):
         load_model, get_final_result = _load_lstm_predict_funcs()
         red_graph, red_sess, blue_graph, blue_sess, pred_key_d, _ = load_model("dlt")
         windows_size = 3
-        predict_features = data_desc.iloc[:windows_size]
+        # 训练时 x 是升序（旧→新），推理时也必须保持相同顺序
+        # data_asc 最后 windows_size 期即为最近 N 期，按时序排列（旧→新）
+        predict_features = data_asc.iloc[-windows_size:]
+        # 验证排序方向
+        if len(predict_features) >= 2:
+            issues = predict_features["期数"].astype(int).tolist()
+            if issues[0] > issues[-1]:
+                logger.warning(
+                    "LSTM输入数据排序异常（新→旧），与训练时的升序（旧→新）不一致！"
+                    "预测结果可能不可靠。正在反转..."
+                )
+                predict_features = predict_features.iloc[::-1]
         pred_d = get_final_result(red_graph, red_sess, blue_graph, blue_sess, pred_key_d, "dlt", predict_features)
         lstm_front_nums = extract_front_nums_from_pred(pred_d)
-        logger.info("LSTM前区预测5码: {}".format(lstm_front_nums))
+        logger.info("LSTM前区预测5码: {} (输入期号范围: {} → {})".format(
+            lstm_front_nums,
+            int(predict_features["期数"].iloc[0]),
+            int(predict_features["期数"].iloc[-1]),
+        ))
 
     # RF
     rf_model, rf_meta = (None, None)
