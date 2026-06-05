@@ -253,28 +253,9 @@ def run_backtest_core(
         strategy_cfg["ensemble_weights"] = old_weights
         strategy_cfg["rule_filters"] = old_rules
 
-    if not records:
-        return {
-            "strategy_name": strategy_name,
-            "periods": 0,
-            "total_cost": 0,
-            "total_reward": 0,
-            "total_profit": 0,
-            "roi": 0.0,
-            "records": [],
-        }
-
-    hit3_count = sum(1 for r in records if r["front_hit"] >= 3)
-    return {
-        "strategy_name": strategy_name,
-        "periods": len(records),
-        "total_cost": int(total_cost),
-        "total_reward": int(total_reward),
-        "total_profit": int(total_reward - total_cost),
-        "roi": float((total_reward - total_cost) / total_cost) if total_cost > 0 else 0.0,
-        "hit3_or_more_rate": float(hit3_count / len(records)) if records else 0.0,
-        "records": records,
-    }
+    metrics = compute_strategy_metrics(records)
+    metrics["records"] = records
+    return metrics
 
 
 def _normalize_weights_no_lstm(weights):
@@ -302,6 +283,94 @@ def _normalize_weights_no_lstm(weights):
 
 
 # ============================================================
+#  通用指标计算 —— 所有策略统一调用
+# ============================================================
+
+def compute_strategy_metrics(records):
+    """从逐期 records 计算全套回测评估指标。
+
+    所有策略（main / random / hot_number / gap_only）复用此函数，
+    确保指标定义和计算方式完全一致。
+
+    Args:
+        records: list of dict，每期一条，至少包含:
+            strategy_name, cost, reward, profit, cumulative_profit, front_hit
+
+    Returns:
+        dict: 包含 periods, total_cost, total_reward, total_profit, roi,
+              avg_front_hit, hit2_or_more_rate, hit3_or_more_rate,
+              max_drawdown, max_consecutive_loss, avg_period_profit, profit_std
+    """
+    if not records:
+        return {
+            "strategy_name": "unknown",
+            "periods": 0,
+            "total_cost": 0,
+            "total_reward": 0,
+            "total_profit": 0,
+            "roi": 0.0,
+            "avg_front_hit": 0.0,
+            "hit2_or_more_rate": 0.0,
+            "hit3_or_more_rate": 0.0,
+            "max_drawdown": 0.0,
+            "max_consecutive_loss": 0,
+            "avg_period_profit": 0.0,
+            "profit_std": 0.0,
+        }
+
+    df = pd.DataFrame(records)
+    periods = len(df)
+    total_cost = int(df["cost"].sum())
+    total_reward = int(df["reward"].sum())
+    total_profit = int(df["profit"].sum())
+    roi = float(total_profit / total_cost) if total_cost > 0 else 0.0
+
+    # 前区命中
+    avg_front_hit = float(df["front_hit"].mean())
+    hit2_count = int((df["front_hit"] >= 2).sum())
+    hit3_count = int((df["front_hit"] >= 3).sum())
+    hit2_rate = float(hit2_count / periods) if periods > 0 else 0.0
+    hit3_rate = float(hit3_count / periods) if periods > 0 else 0.0
+
+    # 最大回撤：cumulative_profit 曲线从历史最高点的最大跌幅
+    cum = df["cumulative_profit"].values.astype(float)
+    peak = np.maximum.accumulate(cum)
+    max_drawdown = float((peak - cum).max()) if len(cum) > 0 else 0.0
+
+    # 最长连续亏损期数：profit < 0 为亏损，profit >= 0 中断
+    profit_arr = df["profit"].values
+    max_loss_streak = 0
+    current_streak = 0
+    for p in profit_arr:
+        if p < 0:
+            current_streak += 1
+            max_loss_streak = max(max_loss_streak, current_streak)
+        else:
+            current_streak = 0
+
+    avg_period_profit = float(total_profit / periods) if periods > 0 else 0.0
+    profit_std = float(df["profit"].std(ddof=0)) if periods > 1 else 0.0
+
+    name = records[0].get("strategy_name", "unknown") if records else "unknown"
+
+    return {
+        "strategy_name": name,
+        "periods": periods,
+        "total_cost": total_cost,
+        "total_reward": total_reward,
+        "total_profit": total_profit,
+        "roi": roi,
+        "avg_front_hit": avg_front_hit,
+        "hit2_or_more_rate": hit2_rate,
+        "hit3_or_more_rate": hit3_rate,
+        "max_drawdown": max_drawdown,
+        "max_consecutive_loss": max_loss_streak,
+        "avg_period_profit": avg_period_profit,
+        "profit_std": profit_std,
+    }
+
+
+# ============================================================
 #  基线策略
 # ============================================================
 
@@ -309,17 +378,25 @@ def run_random_baseline(data_asc, start_idx, end_idx,
                         n_trials=1, rng_seed=42):
     """随机基线：每期随机选 5 个前区号码 + 后区全包。
 
-    运行 n_trials 次并取平均，降低随机波动。
-    当 n_trials > 1 时，输出 roi/profit/hit3_or_more_rate 的 mean±std。
+    运行 n_trials 次独立试验：
+    1. 每个 trial 独立生成随机号码，计算完整的逐期 records
+    2. 每个 trial 调用 compute_strategy_metrics 得到完整指标
+    3. 所有 trial 的指标取均值作为最终结果
+    4. n_trials > 1 时额外计算各指标的标准差
+
+    注意：hit3_or_more_rate 等比例指标的正确计算方式是
+    "先在每个 trial 内计算比例，再对 trials 求均值/std"，
+    而非"把所有 trial 的前区命中平均后再判断 >=3"。
 
     奖金计算自动根据每期期号选择适用的奖级表（26014前后）。
 
     Returns:
-        dict: 包含 total_profit, roi, hit3_or_more_rate, records；
-              当 n_trials>1 时额外包含 roi_std, profit_std, hit3_std
+        dict: 包含所有 metrics 的均值，以及 records（多 trial 均值）。
+              当 n_trials>1 时额外包含 _std 后缀的标准差字段。
     """
     rng = random.Random(rng_seed)
-    trial_summaries = []  # 每个 trial 的汇总统计
+    all_trial_metrics = []   # 每个 trial 的完整 metrics
+    all_trial_records = []   # 所有 trial 的原始 records（用于合并输出）
 
     for trial in range(n_trials):
         records = []
@@ -360,27 +437,23 @@ def run_random_baseline(data_asc, start_idx, end_idx,
                 "cumulative_profit": int(total_reward - total_cost),
             })
 
-        # 每个 trial 的独立汇总
-        trial_df = pd.DataFrame(records)
-        if len(trial_df) == 0:
+        if len(records) == 0:
             continue
-        trial_summaries.append({
-            "profit": int(total_reward - total_cost),
-            "roi": float((total_reward - total_cost) / total_cost) if total_cost > 0 else 0.0,
-            "hit3_or_more_rate": float(sum(1 for r in records if r["front_hit"] >= 3) / len(records)),
-            "records": records,
-        })
-        all_trial_records = []
-        for ts in trial_summaries:
-            all_trial_records.extend(ts["records"])
 
-    if len(trial_summaries) == 0:
-        return {"strategy_name": "random", "periods": 0, "total_cost": 0,
-                "total_reward": 0, "total_profit": 0, "roi": 0.0,
-                "hit3_or_more_rate": 0.0, "records": []}
+        # 每个 trial 独立计算完整指标（包括 hit2/hit3/drawdown 等）
+        trial_metrics = compute_strategy_metrics(records)
+        trial_metrics["strategy_name"] = "random"
+        all_trial_metrics.append(trial_metrics)
+        all_trial_records.append(records)
 
-    # 汇总统计：按 issue 对多 trial 取平均
-    merged_df = pd.DataFrame(all_trial_records)
+    if len(all_trial_metrics) == 0:
+        empty = compute_strategy_metrics([])
+        empty["strategy_name"] = "random"
+        empty["records"] = []
+        return empty
+
+    # --- 合并逐期 records（按 issue 对多 trial 取平均，用于 CSV 明细输出）---
+    merged_df = pd.DataFrame([r for recs in all_trial_records for r in recs])
     summary = merged_df.groupby("issue").agg({
         "cost": "mean", "reward": "mean", "profit": "mean",
         "front_hit": "mean",
@@ -390,35 +463,40 @@ def run_random_baseline(data_asc, start_idx, end_idx,
     summary["selected_front"] = merged_df.groupby("issue")["selected_front"].first().values
     summary["actual_front"] = merged_df.groupby("issue")["actual_front"].first().values
     summary["front_hit"] = summary["front_hit"].round(2)
-
     records_out = summary.to_dict("records")
-    total_cost = int(summary["cost"].sum())
-    total_reward = int(summary["reward"].sum())
-    total_profit = int(summary["profit"].sum())
-    roi = float(total_profit / total_cost) if total_cost > 0 else 0.0
 
-    # 计算 front_hit>=3 的比例：取各 trial 独立 hit3 率的均值
-    hit3_rate = float(np.mean([ts["hit3_or_more_rate"] for ts in trial_summaries])) if trial_summaries else 0.0
+    # --- 跨 trial 聚合指标：各 trial 独立计算，再取均值 ---
+    metric_keys = [
+        "periods", "total_cost", "total_reward", "total_profit", "roi",
+        "avg_front_hit", "hit2_or_more_rate", "hit3_or_more_rate",
+        "max_drawdown", "max_consecutive_loss",
+        "avg_period_profit", "profit_std",
+    ]
+    result = {"strategy_name": "random", "records": records_out}
 
-    result = {
-        "strategy_name": "random",
-        "periods": len(records_out),
-        "total_cost": total_cost,
-        "total_reward": total_reward,
-        "total_profit": total_profit,
-        "roi": roi,
-        "hit3_or_more_rate": hit3_rate,
-        "records": records_out,
-    }
+    for key in metric_keys:
+        values = [m[key] for m in all_trial_metrics]
+        result[key] = float(np.mean(values))
 
-    # n_trials > 1 时附加 mean±std
+    # 整数类型保持为 int
+    for int_key in ["periods", "total_cost", "total_reward", "total_profit",
+                     "max_consecutive_loss"]:
+        if int_key in result:
+            result[int_key] = int(round(result[int_key]))
+
+    # n_trials > 1 时附加标准差
     if n_trials > 1:
-        profits = [ts["profit"] for ts in trial_summaries]
-        rois = [ts["roi"] for ts in trial_summaries]
-        hit3s = [ts["hit3_or_more_rate"] for ts in trial_summaries]
-        result["profit_std"] = float(np.std(profits)) if len(profits) > 1 else 0.0
-        result["roi_std"] = float(np.std(rois)) if len(rois) > 1 else 0.0
-        result["hit3_std"] = float(np.std(hit3s)) if len(hit3s) > 1 else 0.0
+        std_keys = [
+            "total_profit", "roi", "avg_front_hit",
+            "hit2_or_more_rate", "hit3_or_more_rate",
+            "max_drawdown", "max_consecutive_loss",
+        ]
+        for key in std_keys:
+            values = [m[key] for m in all_trial_metrics]
+            if len(values) > 1:
+                result[key + "_std"] = float(np.std(values, ddof=1))
+            else:
+                result[key + "_std"] = 0.0
 
     return result
 
@@ -467,17 +545,9 @@ def run_hot_number_baseline(data_asc, start_idx, end_idx, lookback=50):
             "cumulative_profit": int(total_reward - total_cost),
         })
 
-    hit3_count = sum(1 for r in records if r["front_hit"] >= 3)
-    return {
-        "strategy_name": "hot_number",
-        "periods": len(records),
-        "total_cost": int(total_cost),
-        "total_reward": int(total_reward),
-        "total_profit": int(total_reward - total_cost),
-        "roi": float((total_reward - total_cost) / total_cost) if total_cost > 0 else 0.0,
-        "hit3_or_more_rate": float(hit3_count / len(records)) if records else 0.0,
-        "records": records,
-    }
+    metrics = compute_strategy_metrics(records)
+    metrics["records"] = records
+    return metrics
 
 
 def run_gap_only_baseline(data_asc, start_idx, end_idx):
@@ -524,17 +594,9 @@ def run_gap_only_baseline(data_asc, start_idx, end_idx):
             "cumulative_profit": int(total_reward - total_cost),
         })
 
-    hit3_count = sum(1 for r in records if r["front_hit"] >= 3)
-    return {
-        "strategy_name": "gap_only",
-        "periods": len(records),
-        "total_cost": int(total_cost),
-        "total_reward": int(total_reward),
-        "total_profit": int(total_reward - total_cost),
-        "roi": float((total_reward - total_cost) / total_cost) if total_cost > 0 else 0.0,
-        "hit3_or_more_rate": float(hit3_count / len(records)) if records else 0.0,
-        "records": records,
-    }
+    metrics = compute_strategy_metrics(records)
+    metrics["records"] = records
+    return metrics
 
 
 # ============================================================
@@ -645,6 +707,84 @@ def save_backtest_report(all_results, out_path):
     logger.info("估算说明已保存: {}".format(meta_path))
 
 
+def save_backtest_summary(all_results, out_path):
+    """将各策略的汇总指标输出为 JSON（每个策略一行）。
+
+    对 random baseline，如果存在 _std 后缀字段，一并输出。
+    """
+    summary_rows = []
+    metric_fields = [
+        "strategy_name", "periods",
+        "total_cost", "total_reward", "total_profit", "roi",
+        "avg_front_hit", "hit2_or_more_rate", "hit3_or_more_rate",
+        "max_drawdown", "max_consecutive_loss",
+        "avg_period_profit", "profit_std",
+    ]
+    std_suffixes = [
+        "total_profit_std", "roi_std", "avg_front_hit_std",
+        "hit2_or_more_rate_std", "hit3_or_more_rate_std",
+        "max_drawdown_std", "max_consecutive_loss_std",
+    ]
+
+    for r in all_results:
+        row = {}
+        for f in metric_fields:
+            if f in r:
+                row[f] = r[f]
+        # 附加标准差字段（仅 random multi-trial 有）
+        for s in std_suffixes:
+            if s in r:
+                row[s] = r[s]
+        summary_rows.append(row)
+
+    out_dir = os.path.dirname(out_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(summary_rows, f, ensure_ascii=False, indent=2)
+    logger.info("策略汇总已保存: {} ({} 个策略)".format(out_path, len(summary_rows)))
+
+
+def save_backtest_comparison(main_result, random_result, out_path):
+    """保存 main vs random 的相对指标对比。"""
+    if main_result is None or random_result is None:
+        return
+
+    def _get(r, key):
+        return r.get(key, 0.0)
+
+    comparison = {
+        "main_vs_random_roi_delta":
+            round(_get(main_result, "roi") - _get(random_result, "roi"), 6),
+        "main_vs_random_profit_delta":
+            int(_get(main_result, "total_profit") - _get(random_result, "total_profit")),
+        "main_vs_random_avg_front_hit_delta":
+            round(_get(main_result, "avg_front_hit") - _get(random_result, "avg_front_hit"), 4),
+        "main_vs_random_hit2_delta":
+            round(_get(main_result, "hit2_or_more_rate") - _get(random_result, "hit2_or_more_rate"), 6),
+        "main_vs_random_hit3_delta":
+            round(_get(main_result, "hit3_or_more_rate") - _get(random_result, "hit3_or_more_rate"), 6),
+        "main_vs_random_max_drawdown_delta":
+            round(_get(main_result, "max_drawdown") - _get(random_result, "max_drawdown"), 2),
+        "main_vs_random_max_loss_streak_delta":
+            int(_get(main_result, "max_consecutive_loss") - _get(random_result, "max_consecutive_loss")),
+    }
+
+    out_dir = os.path.dirname(out_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(comparison, f, ensure_ascii=False, indent=2)
+    logger.info("策略对比已保存: {}".format(out_path))
+
+    # 打印对比结论
+    logger.info("=" * 60)
+    logger.info("main vs random 对比:")
+    for k, v in comparison.items():
+        direction = "↑ main better" if v > 0 else ("↓ main worse" if v < 0 else "  equal")
+        logger.info("  {}: {}{}  {}".format(k, '+' if v > 0 else '', v, direction))
+
+
 def apply_best_params_to_config(config_path, best):
     """将最优参数回写到 config.py。"""
     if not os.path.exists(config_path):
@@ -729,6 +869,26 @@ def save_grid_results(results, out_path):
         os.makedirs(out_dir)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
+
+
+# ============================================================
+#  日志辅助
+# ============================================================
+
+def _log_strategy_metrics(r, prefix="  "):
+    """统一格式打印策略指标。"""
+    logger.info("{}profit={:>8d}  roi={:>8.4f}  avg_hit={:.2f}  "
+                "hit2+={:.4f}  hit3+={:.4f}  "
+                "maxDD={:>8.0f}  maxLoss={:>3d}期".format(
+                    prefix,
+                    r.get("total_profit", 0),
+                    r.get("roi", 0.0),
+                    r.get("avg_front_hit", 0.0),
+                    r.get("hit2_or_more_rate", 0.0),
+                    r.get("hit3_or_more_rate", 0.0),
+                    r.get("max_drawdown", 0.0),
+                    int(r.get("max_consecutive_loss", 0)),
+                ))
 
 
 # ============================================================
@@ -836,12 +996,8 @@ def main():
         strategy_name="main",
     )
 
-    logger.info("主策略回测完成: periods={}, cost={}, reward={}, profit={}, "
-                "roi={:.4f}, hit3+_rate={:.4f}".format(
-                    main_result["periods"], main_result["total_cost"],
-                    main_result["total_reward"], main_result["total_profit"],
-                    main_result["roi"], main_result["hit3_or_more_rate"]
-                ))
+    logger.info("主策略回测完成:")
+    _log_strategy_metrics(main_result)
 
     all_results = [main_result]
 
@@ -856,20 +1012,27 @@ def main():
             n_trials=int(args.random_trials),
             rng_seed=42,
         )
-        logger.info("随机基线: profit={}, roi={:.4f}, hit3+={:.4f}".format(
-            random_result["total_profit"], random_result["roi"],
-            random_result["hit3_or_more_rate"]
-        ))
+        logger.info("随机基线:")
+        _log_strategy_metrics(random_result)
         if int(args.random_trials) > 1:
-            logger.info("  随机基线 mean±std ({} trials): profit={:.0f}±{:.0f}, "
-                        "roi={:.4f}±{:.4f}, hit3+={:.4f}±{:.4f}".format(
-                            args.random_trials,
+            logger.info("    mean±std ({} trials):".format(args.random_trials))
+            logger.info("      profit={:.0f}±{:.0f}  roi={:.4f}±{:.4f}  "
+                        "avg_hit={:.2f}±{:.2f}".format(
                             random_result["total_profit"],
-                            random_result.get("profit_std", 0),
+                            random_result.get("total_profit_std", 0),
                             random_result["roi"],
                             random_result.get("roi_std", 0),
+                            random_result["avg_front_hit"],
+                            random_result.get("avg_front_hit_std", 0),
+                        ))
+            logger.info("      hit2+={:.4f}±{:.4f}  hit3+={:.4f}±{:.4f}  "
+                        "maxDD={:.0f}±{:.0f}".format(
+                            random_result["hit2_or_more_rate"],
+                            random_result.get("hit2_or_more_rate_std", 0),
                             random_result["hit3_or_more_rate"],
-                            random_result.get("hit3_std", 0),
+                            random_result.get("hit3_or_more_rate_std", 0),
+                            random_result["max_drawdown"],
+                            random_result.get("max_drawdown_std", 0),
                         ))
         all_results.append(random_result)
 
@@ -877,34 +1040,43 @@ def main():
         hot_result = run_hot_number_baseline(
             data_asc, start_idx, end_idx, lookback=50,
         )
-        logger.info("热号基线: profit={}, roi={:.4f}, hit3+={:.4f}".format(
-            hot_result["total_profit"], hot_result["roi"],
-            hot_result["hit3_or_more_rate"]
-        ))
+        logger.info("热号基线:")
+        _log_strategy_metrics(hot_result)
         all_results.append(hot_result)
 
         # 3) 冷号遗漏基线
         gap_result = run_gap_only_baseline(
             data_asc, start_idx, end_idx,
         )
-        logger.info("冷号基线: profit={}, roi={:.4f}, hit3+={:.4f}".format(
-            gap_result["total_profit"], gap_result["roi"],
-            gap_result["hit3_or_more_rate"]
-        ))
+        logger.info("冷号基线:")
+        _log_strategy_metrics(gap_result)
         all_results.append(gap_result)
 
         # 对比摘要
         logger.info("=" * 60)
         logger.info("策略对比摘要:")
         for r in all_results:
-            logger.info("  {:>16s}: profit={:>8d}, roi={:>8.4f}".format(
-                r["strategy_name"], r["total_profit"], r["roi"]
-            ))
+            logger.info("  {:>16s}: profit={:>8d}  roi={:>8.4f}  "
+                        "avg_hit={:.2f}  hit2+={:.4f}  hit3+={:.4f}".format(
+                            r["strategy_name"], r["total_profit"], r["roi"],
+                            r.get("avg_front_hit", 0.0),
+                            r.get("hit2_or_more_rate", 0.0),
+                            r.get("hit3_or_more_rate", 0.0),
+                        ))
 
     # --- 输出回测报告 ---
     if int(args.output_report) == 1:
         report_path = os.path.join("outputs", "backtest_report.csv")
         save_backtest_report(all_results, report_path)
+
+        # 策略汇总 JSON
+        summary_path = os.path.join("outputs", "backtest_summary.json")
+        save_backtest_summary(all_results, summary_path)
+
+        # main vs random 对比
+        if int(args.baselines) == 1:
+            comparison_path = os.path.join("outputs", "backtest_comparison.json")
+            save_backtest_comparison(main_result, random_result, comparison_path)
 
     # --- 网格搜索 ---
     if int(args.run_grid) == 1:
