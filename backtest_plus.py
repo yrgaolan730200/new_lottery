@@ -1078,6 +1078,9 @@ def main():
                         help="随机基线重复试验次数")
     parser.add_argument("--output_report", default=1, type=int,
                         help="是否输出 backtest_report.csv")
+    parser.add_argument("--ablation", default=0, type=int,
+                        help="消融实验模式：1=运行 stat_only/rf_only/rf_stat "
+                             "+ random/hot_number/gap_only 全部变体")
     args = parser.parse_args()
 
     if args.name != "dlt":
@@ -1136,31 +1139,125 @@ def main():
     if args.rf_mode == "none":
         rf_meta = {"min_history": 120}
 
-    # --- 运行主策略回测 ---
-    logger.info("=" * 60)
-    logger.info("开始主策略回测（rf_mode={}）...".format(args.rf_mode))
+    # 消融实验模式：如果 --ablation 1 且需要 RF，尝试加载
+    if int(args.ablation) == 1:
+        _rf_ab, _rf_meta_ab = maybe_load_rf_model()
+        if _rf_ab is not None:
+            # 预检：用少量历史数据测试 RF 是否能正常预测
+            try:
+                from inference_plus import predict_rf_scores
+                _test_hist = data_asc.iloc[:200]
+                _ = predict_rf_scores(_rf_ab, _test_hist, (10, 30, 100), 120)
+                logger.info("消融实验：RF 模型已加载并通过预检，将运行 rf_only 和 rf_stat")
+            except Exception as _e:
+                logger.error(
+                    "RF 模型预检失败（可能是 sklearn 版本不兼容）: {}。".format(_e)
+                )
+                logger.error(
+                    "请用当前 sklearn 版本重新训练 RF 模型："
+                    "python run_train_rf_model.py --name dlt "
+                    "--train_test_split 0.8 --min_history 120"
+                )
+                _rf_ab = None
+        else:
+            logger.warning(
+                "消融实验：RF 模型不可用，将跳过 rf_only 和 rf_stat。"
+                "请先执行: python run_train_rf_model.py --name dlt "
+                "--train_test_split 0.8 --min_history 120"
+            )
+        # 检查泄漏
+        rf_model_static, rf_meta = _rf_ab, _rf_meta_ab
+        if rf_model_static is not None:
+            train_end = (rf_meta.get("train_issue_end") if rf_meta else None)
+            backtest_start = int(data_asc.iloc[start_idx]["期数"])
+            if train_end is not None and train_end >= backtest_start:
+                logger.warning(
+                    "⚠️  RF 训练截止期号 {} >= 回测起始期号 {}。"
+                    "消融结果可能有泄漏偏差。".format(train_end, backtest_start)
+                )
 
-    main_result = run_backtest_core(
-        data_asc=data_asc,
-        start_idx=start_idx,
-        end_idx=end_idx,
-        top_n_front=strategy["top_n_front"],
-        max_front_combos=strategy["max_front_combos"],
-        play_front_combos=int(strategy.get("play_front_combos", 1)),
-        ensemble_weights=strategy["ensemble_weights"],
-        rule_filters=strategy["rule_filters"],
-        rf_mode=args.rf_mode,
-        rf_model_static=rf_model_static,
-        rf_meta=rf_meta,
-        strategy_name="main",
-    )
+    # --- 运行策略回测 ---
+    all_results = []
+    main_result = None  # will point to stat_only for comparison
 
-    logger.info("主策略回测完成:")
-    _log_strategy_metrics(main_result)
+    if int(args.ablation) == 1:
+        # ================================================================
+        #  消融实验：依次运行所有变体
+        # ================================================================
+        logger.info("=" * 60)
+        logger.info("消融实验模式：依次运行各策略变体...")
 
-    all_results = [main_result]
+        # A) stat_only：纯统计分
+        logger.info("--- stat_only (统计分) ---")
+        stat_result = run_backtest_core(
+            data_asc=data_asc, start_idx=start_idx, end_idx=end_idx,
+            top_n_front=strategy["top_n_front"],
+            max_front_combos=strategy["max_front_combos"],
+            play_front_combos=int(strategy.get("play_front_combos", 1)),
+            ensemble_weights=strategy["ensemble_weights"],
+            rule_filters=strategy["rule_filters"],
+            rf_mode="none",
+            strategy_name="stat_only",
+        )
+        _log_strategy_metrics(stat_result)
+        all_results.append(stat_result)
+        main_result = stat_result
 
-    # --- 运行基线策略 ---
+        # B) rf_only：只用 RF 分
+        if rf_model_static is not None:
+            logger.info("--- rf_only (RF分) ---")
+            rf_only_result = run_backtest_core(
+                data_asc=data_asc, start_idx=start_idx, end_idx=end_idx,
+                top_n_front=strategy["top_n_front"],
+                max_front_combos=strategy["max_front_combos"],
+                play_front_combos=int(strategy.get("play_front_combos", 1)),
+                ensemble_weights={"lstm": 0.0, "rf": 1.0, "stat": 0.0},
+                rule_filters=strategy["rule_filters"],
+                rf_mode="static",
+                rf_model_static=rf_model_static, rf_meta=rf_meta,
+                strategy_name="rf_only",
+            )
+            _log_strategy_metrics(rf_only_result)
+            all_results.append(rf_only_result)
+
+            # C) rf_stat：RF + stat 融合
+            logger.info("--- rf_stat (RF+stat融合) ---")
+            rf_stat_result = run_backtest_core(
+                data_asc=data_asc, start_idx=start_idx, end_idx=end_idx,
+                top_n_front=strategy["top_n_front"],
+                max_front_combos=strategy["max_front_combos"],
+                play_front_combos=int(strategy.get("play_front_combos", 1)),
+                ensemble_weights={"lstm": 0.0, "rf": 0.65, "stat": 0.35},
+                rule_filters=strategy["rule_filters"],
+                rf_mode="static",
+                rf_model_static=rf_model_static, rf_meta=rf_meta,
+                strategy_name="rf_stat",
+            )
+            _log_strategy_metrics(rf_stat_result)
+            all_results.append(rf_stat_result)
+        else:
+            logger.warning("跳过 rf_only / rf_stat（RF 模型不可用）")
+
+    else:
+        # --- 标准模式：单一 main 策略 ---
+        logger.info("=" * 60)
+        logger.info("开始主策略回测（rf_mode={}）...".format(args.rf_mode))
+
+        main_result = run_backtest_core(
+            data_asc=data_asc, start_idx=start_idx, end_idx=end_idx,
+            top_n_front=strategy["top_n_front"],
+            max_front_combos=strategy["max_front_combos"],
+            play_front_combos=int(strategy.get("play_front_combos", 1)),
+            ensemble_weights=strategy["ensemble_weights"],
+            rule_filters=strategy["rule_filters"],
+            rf_mode=args.rf_mode,
+            rf_model_static=rf_model_static, rf_meta=rf_meta,
+            strategy_name="main",
+        )
+        _log_strategy_metrics(main_result)
+        all_results.append(main_result)
+
+    # --- 运行基线策略（消融和标准模式共用）---
     if int(args.baselines) == 1:
         logger.info("=" * 60)
         logger.info("运行基线策略对比...")
@@ -1233,8 +1330,8 @@ def main():
         summary_path = os.path.join("outputs", "backtest_summary.json")
         save_backtest_summary(all_results, summary_path)
 
-        # main vs random 对比
-        if int(args.baselines) == 1:
+        # main (或 stat_only) vs random 对比
+        if int(args.baselines) == 1 and main_result is not None:
             comparison_path = os.path.join("outputs", "backtest_comparison.json")
             save_backtest_comparison(main_result, random_result, comparison_path)
 
@@ -1247,49 +1344,64 @@ def main():
                     os.path.join("outputs", "backtest_random_trials.json"),
                 )
 
-                percentiles = compute_random_percentiles(
-                    main_result, trial_metrics
-                )
-                interpretation = _build_interpretation(percentiles)
-                save_backtest_percentile(
-                    percentiles, interpretation,
-                    len(trial_metrics),
-                    os.path.join("outputs", "backtest_percentile.json"),
-                )
+                # 消融模式：为每个策略变体计算 percentile
+                _pct_targets = [main_result]
+                if int(args.ablation) == 1:
+                    # 也添加 rf_only 和 rf_stat
+                    for r in all_results:
+                        if r["strategy_name"] in ("rf_only", "rf_stat"):
+                            _pct_targets.append(r)
 
-                # --- P1-3 日志摘要 ---
-                logger.info("=" * 60)
-                logger.info("P1-3: main vs random percentile 摘要")
-                logger.info("  main_hit3_or_more_rate={:.4f}  "
-                            "random(mean={:.4f}±{:.4f})  "
-                            "percentile={:.1f}%".format(
-                                main_result.get("hit3_or_more_rate", 0),
-                                random_result.get("hit3_or_more_rate", 0),
-                                random_result.get("hit3_or_more_rate_std", 0),
-                                percentiles.get("main_hit3_or_more_rate_percentile", 0) * 100,
-                            ))
-                logger.info("  main_avg_front_hit={:.4f}  "
-                            "percentile={:.1f}%".format(
-                                main_result.get("avg_front_hit", 0),
-                                percentiles.get("main_avg_front_hit_percentile", 0) * 100,
-                            ))
-                logger.info("  main_roi={:.4f}  "
-                            "percentile={:.1f}%".format(
-                                main_result.get("roi", 0),
-                                percentiles.get("main_roi_percentile", 0) * 100,
-                            ))
-                if "main_roi_truncated_percentile" in percentiles:
-                    logger.info("  main_roi_truncated={:.4f}  "
+                for _target in _pct_targets:
+                    _sname = _target["strategy_name"]
+                    percentiles = compute_random_percentiles(_target, trial_metrics)
+                    interpretation = _build_interpretation(percentiles)
+                    pct_path = os.path.join(
+                        "outputs",
+                        "backtest_percentile_{}.json".format(_sname)
+                    )
+                    save_backtest_percentile(
+                        percentiles, interpretation,
+                        len(trial_metrics), pct_path,
+                    )
+
+                    # --- P1-3 日志摘要 ---
+                    logger.info("=" * 60)
+                    logger.info("P1-3: {} vs random percentile 摘要".format(_sname))
+                    logger.info("  {}_hit3_or_more_rate={:.4f}  "
+                                "random(mean={:.4f}±{:.4f})  "
                                 "percentile={:.1f}%".format(
-                                    main_result.get("roi_truncated", 0),
-                                    percentiles["main_roi_truncated_percentile"] * 100,
+                                    _sname,
+                                    _target.get("hit3_or_more_rate", 0),
+                                    random_result.get("hit3_or_more_rate", 0),
+                                    random_result.get("hit3_or_more_rate_std", 0),
+                                    percentiles.get(
+                                        "main_hit3_or_more_rate_percentile", 0
+                                    ) * 100,
                                 ))
-                over_90 = sum(
-                    1 for v in percentiles.values() if v >= 0.90
-                )
-                logger.info("  main 超过 90% random trials 的指标数: {}/{}".format(
-                    over_90, len(percentiles)
-                ))
+                    logger.info("  {}_avg_front_hit={:.4f}  "
+                                "percentile={:.1f}%".format(
+                                    _sname,
+                                    _target.get("avg_front_hit", 0),
+                                    percentiles.get(
+                                        "main_avg_front_hit_percentile", 0
+                                    ) * 100,
+                                ))
+                    logger.info("  {}_roi_truncated={:.4f}  "
+                                "percentile={:.1f}%".format(
+                                    _sname,
+                                    _target.get("roi_truncated", 0),
+                                    percentiles.get(
+                                        "main_roi_truncated_percentile", 0
+                                    ) * 100,
+                                ))
+                    _over_90 = sum(
+                        1 for v in percentiles.values() if v >= 0.90
+                    )
+                    logger.info(
+                        "  {} 超过 90% random trials 的指标数: {}/{}".format(
+                            _sname, _over_90, len(percentiles)
+                        ))
 
     # --- 网格搜索 ---
     if int(args.run_grid) == 1:
