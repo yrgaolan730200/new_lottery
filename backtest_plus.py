@@ -301,20 +301,21 @@ def compute_strategy_metrics(records):
               avg_front_hit, hit2_or_more_rate, hit3_or_more_rate,
               max_drawdown, max_consecutive_loss, avg_period_profit, profit_std
     """
+    # 截断奖励阈值：单期 reward > cap 时截断，排除极端头奖污染
+    _REWARD_CAP = 10000
+
     if not records:
         return {
             "strategy_name": "unknown",
             "periods": 0,
-            "total_cost": 0,
-            "total_reward": 0,
-            "total_profit": 0,
-            "roi": 0.0,
+            "total_cost": 0, "total_reward": 0, "total_profit": 0, "roi": 0.0,
+            "total_reward_truncated": 0, "total_profit_truncated": 0, "roi_truncated": 0.0,
             "avg_front_hit": 0.0,
-            "hit2_or_more_rate": 0.0,
-            "hit3_or_more_rate": 0.0,
-            "max_drawdown": 0.0,
-            "max_consecutive_loss": 0,
-            "avg_period_profit": 0.0,
+            "hit0_rate": 0.0, "hit1_rate": 0.0, "hit2_rate": 0.0,
+            "hit3_rate": 0.0, "hit4_rate": 0.0, "hit5_rate": 0.0,
+            "hit2_or_more_rate": 0.0, "hit3_or_more_rate": 0.0,
+            "max_drawdown": 0.0, "max_consecutive_loss": 0,
+            "avg_period_profit": 0.0, "avg_period_profit_truncated": 0.0,
             "profit_std": 0.0,
         }
 
@@ -325,12 +326,24 @@ def compute_strategy_metrics(records):
     total_profit = int(df["profit"].sum())
     roi = float(total_profit / total_cost) if total_cost > 0 else 0.0
 
-    # 前区命中
+    # --- 截断收益（排除极端头奖污染）---
+    reward_truncated = np.minimum(df["reward"].values.astype(float), _REWARD_CAP)
+    total_reward_truncated = int(reward_truncated.sum())
+    total_profit_truncated = int(total_reward_truncated - total_cost)
+    roi_truncated = float(total_profit_truncated / total_cost) if total_cost > 0 else 0.0
+    avg_period_profit_truncated = float(total_profit_truncated / periods) if periods > 0 else 0.0
+
+    # --- 前区命中分布（0..5 精确计数）---
+    hit_counts = df["front_hit"].value_counts().to_dict()
+    hit0_rate = float(hit_counts.get(0, 0) / periods)
+    hit1_rate = float(hit_counts.get(1, 0) / periods)
+    hit2_rate = float(hit_counts.get(2, 0) / periods)
+    hit3_rate = float(hit_counts.get(3, 0) / periods)
+    hit4_rate = float(hit_counts.get(4, 0) / periods)
+    hit5_rate = float(hit_counts.get(5, 0) / periods)
     avg_front_hit = float(df["front_hit"].mean())
-    hit2_count = int((df["front_hit"] >= 2).sum())
-    hit3_count = int((df["front_hit"] >= 3).sum())
-    hit2_rate = float(hit2_count / periods) if periods > 0 else 0.0
-    hit3_rate = float(hit3_count / periods) if periods > 0 else 0.0
+    hit2_or_more = hit2_rate + hit3_rate + hit4_rate + hit5_rate
+    hit3_or_more = hit3_rate + hit4_rate + hit5_rate
 
     # 最大回撤：cumulative_profit 曲线从历史最高点的最大跌幅
     cum = df["cumulative_profit"].values.astype(float)
@@ -360,9 +373,19 @@ def compute_strategy_metrics(records):
         "total_reward": total_reward,
         "total_profit": total_profit,
         "roi": roi,
+        # 截断收益（reward_cap=10000，排除5+2/5+1等极端事件）
+        "total_reward_truncated": total_reward_truncated,
+        "total_profit_truncated": total_profit_truncated,
+        "roi_truncated": roi_truncated,
+        "avg_period_profit_truncated": avg_period_profit_truncated,
+        # 前区命中分布
         "avg_front_hit": avg_front_hit,
-        "hit2_or_more_rate": hit2_rate,
-        "hit3_or_more_rate": hit3_rate,
+        "hit0_rate": hit0_rate, "hit1_rate": hit1_rate,
+        "hit2_rate": hit2_rate, "hit3_rate": hit3_rate,
+        "hit4_rate": hit4_rate, "hit5_rate": hit5_rate,
+        "hit2_or_more_rate": hit2_or_more,
+        "hit3_or_more_rate": hit3_or_more,
+        # 风险指标
         "max_drawdown": max_drawdown,
         "max_consecutive_loss": max_loss_streak,
         "avg_period_profit": avg_period_profit,
@@ -468,7 +491,12 @@ def run_random_baseline(data_asc, start_idx, end_idx,
     # --- 跨 trial 聚合指标：各 trial 独立计算，再取均值 ---
     metric_keys = [
         "periods", "total_cost", "total_reward", "total_profit", "roi",
-        "avg_front_hit", "hit2_or_more_rate", "hit3_or_more_rate",
+        "total_reward_truncated", "total_profit_truncated", "roi_truncated",
+        "avg_period_profit_truncated",
+        "avg_front_hit",
+        "hit0_rate", "hit1_rate", "hit2_rate", "hit3_rate",
+        "hit4_rate", "hit5_rate",
+        "hit2_or_more_rate", "hit3_or_more_rate",
         "max_drawdown", "max_consecutive_loss",
         "avg_period_profit", "profit_std",
     ]
@@ -480,6 +508,7 @@ def run_random_baseline(data_asc, start_idx, end_idx,
 
     # 整数类型保持为 int
     for int_key in ["periods", "total_cost", "total_reward", "total_profit",
+                     "total_reward_truncated", "total_profit_truncated",
                      "max_consecutive_loss"]:
         if int_key in result:
             result[int_key] = int(round(result[int_key]))
@@ -487,16 +516,21 @@ def run_random_baseline(data_asc, start_idx, end_idx,
     # n_trials > 1 时附加标准差
     if n_trials > 1:
         std_keys = [
-            "total_profit", "roi", "avg_front_hit",
+            "total_profit", "total_profit_truncated",
+            "roi", "roi_truncated",
+            "avg_front_hit",
             "hit2_or_more_rate", "hit3_or_more_rate",
             "max_drawdown", "max_consecutive_loss",
         ]
         for key in std_keys:
-            values = [m[key] for m in all_trial_metrics]
+            values = [m.get(key, 0.0) for m in all_trial_metrics]
             if len(values) > 1:
                 result[key + "_std"] = float(np.std(values, ddof=1))
             else:
                 result[key + "_std"] = 0.0
+
+    # 附加所有 trial 级指标（用于 percentile 计算和输出）
+    result["_trial_metrics"] = all_trial_metrics
 
     return result
 
@@ -716,12 +750,19 @@ def save_backtest_summary(all_results, out_path):
     metric_fields = [
         "strategy_name", "periods",
         "total_cost", "total_reward", "total_profit", "roi",
-        "avg_front_hit", "hit2_or_more_rate", "hit3_or_more_rate",
+        "total_reward_truncated", "total_profit_truncated", "roi_truncated",
+        "avg_front_hit",
+        "hit0_rate", "hit1_rate", "hit2_rate", "hit3_rate",
+        "hit4_rate", "hit5_rate",
+        "hit2_or_more_rate", "hit3_or_more_rate",
         "max_drawdown", "max_consecutive_loss",
-        "avg_period_profit", "profit_std",
+        "avg_period_profit", "avg_period_profit_truncated",
+        "profit_std",
     ]
     std_suffixes = [
-        "total_profit_std", "roi_std", "avg_front_hit_std",
+        "total_profit_std", "total_profit_truncated_std",
+        "roi_std", "roi_truncated_std",
+        "avg_front_hit_std",
         "hit2_or_more_rate_std", "hit3_or_more_rate_std",
         "max_drawdown_std", "max_consecutive_loss_std",
     ]
@@ -783,6 +824,123 @@ def save_backtest_comparison(main_result, random_result, out_path):
     for k, v in comparison.items():
         direction = "↑ main better" if v > 0 else ("↓ main worse" if v < 0 else "  equal")
         logger.info("  {}: {}{}  {}".format(k, '+' if v > 0 else '', v, direction))
+
+
+# ============================================================
+#  Random percentile & trial 级输出
+# ============================================================
+
+def compute_random_percentiles(main_result, trial_metrics_list):
+    """计算 main 策略在 random trial 分布中的百分位。
+
+    - 越大越好的指标：percentile = P(random <= main)
+    - 越小越好的指标：percentile = P(random >= main)
+
+    percentile 越高表示 main 相对 random 越好。
+    """
+    if not trial_metrics_list:
+        return {}
+
+    higher_better = [
+        "roi", "total_profit", "avg_front_hit",
+        "hit2_or_more_rate", "hit3_or_more_rate",
+        "roi_truncated", "total_profit_truncated",
+    ]
+    lower_better = [
+        "max_drawdown", "max_consecutive_loss",
+    ]
+
+    percentiles = {}
+    for key in higher_better:
+        main_val = main_result.get(key, 0.0)
+        random_vals = [m.get(key, 0.0) for m in trial_metrics_list]
+        count_le = sum(1 for v in random_vals if v <= main_val)
+        percentiles["main_" + key + "_percentile"] = (
+            float(count_le / len(random_vals)) if random_vals else 0.0
+        )
+
+    for key in lower_better:
+        main_val = main_result.get(key, 0.0)
+        random_vals = [m.get(key, 0.0) for m in trial_metrics_list]
+        count_ge = sum(1 for v in random_vals if v >= main_val)
+        percentiles["main_" + key + "_percentile"] = (
+            float(count_ge / len(random_vals)) if random_vals else 0.0
+        )
+
+    return percentiles
+
+
+def _build_interpretation(percentiles):
+    """生成百分位的人类可读解释。"""
+    interp = {}
+    labels = {
+        "main_roi_percentile": "roi",
+        "main_total_profit_percentile": "total_profit",
+        "main_avg_front_hit_percentile": "avg_front_hit",
+        "main_hit2_or_more_rate_percentile": "hit2_or_more_rate",
+        "main_hit3_or_more_rate_percentile": "hit3_or_more_rate",
+        "main_max_drawdown_percentile": "max_drawdown",
+        "main_max_consecutive_loss_percentile": "max_consecutive_loss",
+        "main_roi_truncated_percentile": "roi_truncated",
+        "main_total_profit_truncated_percentile": "total_profit_truncated",
+    }
+    for key, label in labels.items():
+        pct = percentiles.get(key)
+        if pct is not None:
+            pct_pct = round(pct * 100, 1)
+            interp[label] = f"main 超过了 {pct_pct}% 的 random trials"
+    return interp
+
+
+def save_random_trials(trial_metrics_list, csv_path, json_path):
+    """保存 random trial 级汇总数据为 CSV 和 JSON。"""
+    if not trial_metrics_list:
+        return
+
+    # CSV
+    trial_fields = [
+        "periods", "total_cost", "total_reward", "total_profit", "roi",
+        "total_reward_truncated", "total_profit_truncated", "roi_truncated",
+        "avg_front_hit",
+        "hit0_rate", "hit1_rate", "hit2_rate", "hit3_rate",
+        "hit4_rate", "hit5_rate",
+        "hit2_or_more_rate", "hit3_or_more_rate",
+        "max_drawdown", "max_consecutive_loss",
+        "avg_period_profit", "avg_period_profit_truncated",
+        "profit_std",
+    ]
+    rows = []
+    for i, m in enumerate(trial_metrics_list):
+        row = {"trial_id": i + 1}
+        for f in trial_fields:
+            row[f] = m.get(f, None)
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    out_dir = os.path.dirname(csv_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    logger.info("随机 trial 明细已保存: {} ({} 行)".format(csv_path, len(df)))
+
+    # JSON
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+    logger.info("随机 trial JSON 已保存: {}".format(json_path))
+
+
+def save_backtest_percentile(percentiles, interpretation, n_trials, out_path):
+    """保存 main vs random percentile 文件。"""
+    payload = {
+        "random_trials": n_trials,
+        "main_vs_random_percentiles": percentiles,
+        "interpretation": interpretation,
+    }
+    out_dir = os.path.dirname(out_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    logger.info("Percentile 文件已保存: {}".format(out_path))
 
 
 def apply_best_params_to_config(config_path, best):
@@ -877,12 +1035,13 @@ def save_grid_results(results, out_path):
 
 def _log_strategy_metrics(r, prefix="  "):
     """统一格式打印策略指标。"""
-    logger.info("{}profit={:>8d}  roi={:>8.4f}  avg_hit={:.2f}  "
-                "hit2+={:.4f}  hit3+={:.4f}  "
+    logger.info("{}profit={:>8d}  roi={:>8.4f}  roi_t={:>8.4f}  "
+                "avg_hit={:.2f}  hit2+={:.4f}  hit3+={:.4f}  "
                 "maxDD={:>8.0f}  maxLoss={:>3d}期".format(
                     prefix,
                     r.get("total_profit", 0),
                     r.get("roi", 0.0),
+                    r.get("roi_truncated", 0.0),
                     r.get("avg_front_hit", 0.0),
                     r.get("hit2_or_more_rate", 0.0),
                     r.get("hit3_or_more_rate", 0.0),
@@ -1054,11 +1213,12 @@ def main():
 
         # 对比摘要
         logger.info("=" * 60)
-        logger.info("策略对比摘要:")
+        logger.info("策略对比摘要 (roi_t = roi_truncated@cap=10000):")
         for r in all_results:
-            logger.info("  {:>16s}: profit={:>8d}  roi={:>8.4f}  "
+            logger.info("  {:>16s}: profit={:>8d}  roi={:>8.4f}  roi_t={:>8.4f}  "
                         "avg_hit={:.2f}  hit2+={:.4f}  hit3+={:.4f}".format(
                             r["strategy_name"], r["total_profit"], r["roi"],
+                            r.get("roi_truncated", 0.0),
                             r.get("avg_front_hit", 0.0),
                             r.get("hit2_or_more_rate", 0.0),
                             r.get("hit3_or_more_rate", 0.0),
@@ -1077,6 +1237,59 @@ def main():
         if int(args.baselines) == 1:
             comparison_path = os.path.join("outputs", "backtest_comparison.json")
             save_backtest_comparison(main_result, random_result, comparison_path)
+
+            # --- P1-3: random trial 明细 & percentile ---
+            trial_metrics = random_result.get("_trial_metrics", [])
+            if trial_metrics:
+                save_random_trials(
+                    trial_metrics,
+                    os.path.join("outputs", "backtest_random_trials.csv"),
+                    os.path.join("outputs", "backtest_random_trials.json"),
+                )
+
+                percentiles = compute_random_percentiles(
+                    main_result, trial_metrics
+                )
+                interpretation = _build_interpretation(percentiles)
+                save_backtest_percentile(
+                    percentiles, interpretation,
+                    len(trial_metrics),
+                    os.path.join("outputs", "backtest_percentile.json"),
+                )
+
+                # --- P1-3 日志摘要 ---
+                logger.info("=" * 60)
+                logger.info("P1-3: main vs random percentile 摘要")
+                logger.info("  main_hit3_or_more_rate={:.4f}  "
+                            "random(mean={:.4f}±{:.4f})  "
+                            "percentile={:.1f}%".format(
+                                main_result.get("hit3_or_more_rate", 0),
+                                random_result.get("hit3_or_more_rate", 0),
+                                random_result.get("hit3_or_more_rate_std", 0),
+                                percentiles.get("main_hit3_or_more_rate_percentile", 0) * 100,
+                            ))
+                logger.info("  main_avg_front_hit={:.4f}  "
+                            "percentile={:.1f}%".format(
+                                main_result.get("avg_front_hit", 0),
+                                percentiles.get("main_avg_front_hit_percentile", 0) * 100,
+                            ))
+                logger.info("  main_roi={:.4f}  "
+                            "percentile={:.1f}%".format(
+                                main_result.get("roi", 0),
+                                percentiles.get("main_roi_percentile", 0) * 100,
+                            ))
+                if "main_roi_truncated_percentile" in percentiles:
+                    logger.info("  main_roi_truncated={:.4f}  "
+                                "percentile={:.1f}%".format(
+                                    main_result.get("roi_truncated", 0),
+                                    percentiles["main_roi_truncated_percentile"] * 100,
+                                ))
+                over_90 = sum(
+                    1 for v in percentiles.values() if v >= 0.90
+                )
+                logger.info("  main 超过 90% random trials 的指标数: {}/{}".format(
+                    over_90, len(percentiles)
+                ))
 
     # --- 网格搜索 ---
     if int(args.run_grid) == 1:
