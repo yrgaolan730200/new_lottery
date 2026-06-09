@@ -110,6 +110,61 @@ def _train_rf_on_history(history_df_asc, windows, min_history):
 
 
 # ============================================================
+#  可变评分模式 —— 支持 gap 方向实验
+# ============================================================
+
+def _compute_stat_miss_penalty(hist, windows):
+    """当前逻辑：短中长期频次加权 - 0.20 * miss（遗漏惩罚）。"""
+    return calc_stat_scores(hist, windows=windows)
+
+
+def _compute_stat_no_miss(hist, windows):
+    """只用频次，不使用遗漏值。"""
+    short, mid, long = windows
+    s_freq = calc_front_frequency(hist, short)
+    m_freq = calc_front_frequency(hist, mid)
+    l_freq = calc_front_frequency(hist, long)
+    raw = 0.45 * s_freq + 0.35 * m_freq + 0.20 * l_freq
+    return _safe_normalize(raw)
+
+
+def _compute_stat_miss_bonus(hist, windows):
+    """频次加权 + 0.20 * miss（遗漏加分：越久未出越高分）。"""
+    short, mid, long = windows
+    s_freq = calc_front_frequency(hist, short)
+    m_freq = calc_front_frequency(hist, mid)
+    l_freq = calc_front_frequency(hist, long)
+    miss = calc_front_missing(hist)
+    raw = 0.45 * s_freq + 0.35 * m_freq + 0.20 * l_freq + 0.20 * miss
+    return _safe_normalize(raw)
+
+
+def _compute_gap_only_scores(hist, windows=None):
+    """纯遗漏值（gap_only 基线使用的评分）。"""
+    miss = calc_front_missing(hist)
+    return _safe_normalize(miss)
+
+
+def _compute_freq_only_scores(hist, windows):
+    """纯频次评分（用于 rf_stat_gap 的 freq 组件）。"""
+    short, mid, long = windows
+    s_freq = calc_front_frequency(hist, short)
+    m_freq = calc_front_frequency(hist, mid)
+    l_freq = calc_front_frequency(hist, long)
+    raw = 0.45 * s_freq + 0.35 * m_freq + 0.20 * l_freq
+    return _safe_normalize(raw)
+
+
+def _safe_normalize(v):
+    """安全归一化到 [0,1]，处理全零/全等异常。"""
+    arr = np.array(v, dtype=float)
+    mn, mx = arr.min(), arr.max()
+    if mx - mn < 1e-12:
+        return np.zeros_like(arr)
+    return (arr - mn) / (mx - mn)
+
+
+# ============================================================
 #  核心回测（RF + stat 融合，无 LSTM）
 # ============================================================
 
@@ -126,6 +181,7 @@ def run_backtest_core(
     rf_model_static=None,
     rf_meta=None,
     strategy_name="main",
+    score_mode="stat_miss_penalty",
     rng_seed=None,
 ):
     """执行 5+12 策略滚动回测。
@@ -188,8 +244,17 @@ def run_backtest_core(
             elif rf_mode == "walk_forward":
                 rf_model = _train_rf_on_history(hist, score_windows, min_history)
 
-            # --- 融合评分（无 LSTM）---
-            stat_scores = calc_stat_scores(hist, windows=score_windows)
+            # --- 融合评分（无 LSTM，按 score_mode 切换）---
+            if score_mode == "stat_miss_penalty":
+                stat_scores = _compute_stat_miss_penalty(hist, score_windows)
+            elif score_mode == "stat_no_miss":
+                stat_scores = _compute_stat_no_miss(hist, score_windows)
+            elif score_mode == "stat_miss_bonus":
+                stat_scores = _compute_stat_miss_bonus(hist, score_windows)
+            elif score_mode == "gap_only":
+                stat_scores = _compute_gap_only_scores(hist)
+            else:
+                stat_scores = _compute_stat_miss_penalty(hist, score_windows)
 
             if rf_model is not None and len(hist) >= min_history:
                 rf_scores = predict_rf_scores(rf_model, hist,
@@ -198,13 +263,38 @@ def run_backtest_core(
             else:
                 rf_scores = np.zeros(35, dtype=float)
 
+            # rf_stat_gap: RF + freq + gap 三组件融合
+            gap_scores = np.zeros(35, dtype=float)
+            freq_only = np.zeros(35, dtype=float)
+            if score_mode == "rf_stat_gap":
+                gap_scores = _compute_gap_only_scores(hist)
+                freq_only = _compute_freq_only_scores(hist, score_windows)
+
             # LSTM 分置零（回测中不运行 LSTM 推理）
             lstm_scores = np.zeros(35, dtype=float)
 
             w = _normalize_weights_no_lstm(ensemble_weights)
-            ensemble = (w["lstm"] * lstm_scores +
-                        w["rf"] * rf_scores +
-                        w["stat"] * stat_scores)
+
+            if score_mode == "rf_stat_gap":
+                # 三组件融合：rf + freq + gap
+                # 使用 ensemble_weights 传递特殊权重:
+                # lstm槽 → gap权重, rf槽 → rf权重, stat槽 → freq权重
+                ensemble = (w.get("lstm", 0.0) * gap_scores +
+                            w.get("rf", 0.50) * rf_scores +
+                            w.get("stat", 0.30) * freq_only)
+                # 确保 rf_stat_gap 权重正确（不被 _normalize_weights_no_lstm 改动）
+                _w_gap = ensemble_weights.get("lstm", 0.20)
+                _w_rf = ensemble_weights.get("rf", 0.50)
+                _w_freq = ensemble_weights.get("stat", 0.30)
+                _total = _w_gap + _w_rf + _w_freq
+                if _total > 0:
+                    ensemble = ((_w_gap / _total) * gap_scores +
+                                (_w_rf / _total) * rf_scores +
+                                (_w_freq / _total) * freq_only)
+            else:
+                ensemble = (w["lstm"] * lstm_scores +
+                            w["rf"] * rf_scores +
+                            w["stat"] * stat_scores)
 
             # --- 生成前区组合 ---
             _, combos = generate_front_combos(ensemble, last_front_set)
@@ -1081,6 +1171,10 @@ def main():
     parser.add_argument("--ablation", default=0, type=int,
                         help="消融实验模式：1=运行 stat_only/rf_only/rf_stat "
                              "+ random/hot_number/gap_only 全部变体")
+    parser.add_argument("--gap_experiment", default=0, type=int,
+                        help="gap方向实验：1=运行 stat_miss_penalty/"
+                             "stat_no_miss/stat_miss_bonus/rf_stat/rf_stat_gap/"
+                             "gap_only/random/hot_number 全部变体")
     args = parser.parse_args()
 
     if args.name != "dlt":
@@ -1178,9 +1272,69 @@ def main():
 
     # --- 运行策略回测 ---
     all_results = []
-    main_result = None  # will point to stat_only for comparison
+    main_result = None  # will point to stat_miss_penalty or stat_only for comparison
 
-    if int(args.ablation) == 1:
+    if int(args.gap_experiment) == 1:
+        # ================================================================
+        #  Gap 方向实验：测试遗漏值的不同处理方式
+        # ================================================================
+        logger.info("=" * 60)
+        logger.info("Gap 方向实验模式：依次运行遗漏值惩罚/忽略/加分变体...")
+
+        # 加载 RF（如需要）
+        _rf_gap, _rf_meta_gap = maybe_load_rf_model()
+        _rf_ok = False
+        if _rf_gap is not None:
+            try:
+                from inference_plus import predict_rf_scores
+                _test_hist = data_asc.iloc[:200]
+                _ = predict_rf_scores(_rf_gap, _test_hist, (10, 30, 100), 120)
+                _rf_ok = True
+                logger.info("Gap 实验：RF 模型已加载并通过预检")
+            except Exception as _e:
+                logger.error("RF 预检失败，跳过 rf_stat/rf_stat_gap: {}".format(_e))
+        else:
+            logger.warning("RF 模型不可用，将跳过 rf_stat 和 rf_stat_gap")
+
+        _gap_variants = [
+            ("stat_miss_penalty", "stat_miss_penalty",
+             {"lstm": 0.0, "rf": 0.0, "stat": 1.0}, "none", None),
+            ("stat_no_miss", "stat_no_miss",
+             {"lstm": 0.0, "rf": 0.0, "stat": 1.0}, "none", None),
+            ("stat_miss_bonus", "stat_miss_bonus",
+             {"lstm": 0.0, "rf": 0.0, "stat": 1.0}, "none", None),
+            ("gap_score", "gap_only",
+             {"lstm": 0.0, "rf": 0.0, "stat": 1.0}, "none", None),
+        ]
+        if _rf_ok:
+            _gap_variants += [
+                ("rf_stat", "stat_miss_penalty",
+                 {"lstm": 0.0, "rf": 0.65, "stat": 0.35}, "static", _rf_gap),
+                ("rf_stat_gap", "rf_stat_gap",
+                 {"lstm": 0.20, "rf": 0.50, "stat": 0.30}, "static", _rf_gap),
+            ]
+
+        for _name, _smode, _w, _rfm, _rfm_static in _gap_variants:
+            logger.info("--- {} ---".format(_name))
+            _rf_meta_use = _rf_meta_gap if _rfm_static is not None else {"min_history": 120}
+            result = run_backtest_core(
+                data_asc=data_asc, start_idx=start_idx, end_idx=end_idx,
+                top_n_front=strategy["top_n_front"],
+                max_front_combos=strategy["max_front_combos"],
+                play_front_combos=int(strategy.get("play_front_combos", 1)),
+                ensemble_weights=_w,
+                rule_filters=strategy["rule_filters"],
+                rf_mode=_rfm, rf_model_static=_rfm_static,
+                rf_meta=_rf_meta_use,
+                score_mode=_smode,
+                strategy_name=_name,
+            )
+            _log_strategy_metrics(result)
+            all_results.append(result)
+            if _name == "stat_miss_penalty":
+                main_result = result
+
+    elif int(args.ablation) == 1:
         # ================================================================
         #  消融实验：依次运行所有变体
         # ================================================================
@@ -1344,13 +1498,18 @@ def main():
                     os.path.join("outputs", "backtest_random_trials.json"),
                 )
 
-                # 消融模式：为每个策略变体计算 percentile
-                _pct_targets = [main_result]
-                if int(args.ablation) == 1:
-                    # 也添加 rf_only 和 rf_stat
-                    for r in all_results:
-                        if r["strategy_name"] in ("rf_only", "rf_stat"):
-                            _pct_targets.append(r)
+                # 实验模式：为每个非 baseline 策略变体计算 percentile
+                _pct_targets = [main_result] if main_result is not None else []
+                _extra_names = set()
+                if int(args.gap_experiment) == 1:
+                    _extra_names = {"stat_no_miss", "stat_miss_bonus",
+                                    "rf_stat", "rf_stat_gap",
+                                    "gap_score", "gap_only", "hot_number"}
+                elif int(args.ablation) == 1:
+                    _extra_names = {"rf_only", "rf_stat"}
+                for r in all_results:
+                    if r["strategy_name"] in _extra_names:
+                        _pct_targets.append(r)
 
                 for _target in _pct_targets:
                     _sname = _target["strategy_name"]
