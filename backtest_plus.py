@@ -140,9 +140,28 @@ def _compute_stat_miss_bonus(hist, windows):
 
 
 def _compute_gap_only_scores(hist, windows=None):
-    """纯遗漏值（gap_only 基线使用的评分）。"""
-    miss = calc_front_missing(hist)
-    return _safe_normalize(miss)
+    """纯遗漏值评分。
+
+    使用原始遗漏值 + 微小号码偏移作为次级排序键。
+    score[n] = gap[n] + n/1000.0
+
+    这样当两个号码遗漏值相同时，号码大的优先级更高，
+    确保 argsort 和 combinations 的 tie-breaking 一致。
+    偏移量 (1/1000) 远小于最小遗漏差 (1)，不会改变主排序。
+    """
+    n_front = 35
+    miss = np.zeros(n_front, dtype=float)
+    if len(hist) == 0:
+        return miss
+    max_back = len(hist) + 1
+    for n in range(1, n_front + 1):
+        gap = max_back
+        for back_idx, (_, row) in enumerate(hist.iloc[::-1].iterrows(), start=1):
+            if n in {int(row[c]) for c in FRONT_COLS}:
+                gap = back_idx
+                break
+        miss[n - 1] = float(gap) + n / 1000.0
+    return miss
 
 
 def _compute_freq_only_scores(hist, windows):
@@ -1175,6 +1194,11 @@ def main():
                         help="gap方向实验：1=运行 stat_miss_penalty/"
                              "stat_no_miss/stat_miss_bonus/rf_stat/rf_stat_gap/"
                              "gap_only/random/hot_number 全部变体")
+    parser.add_argument("--filter_experiment", default=0, type=int,
+                        help="组合过滤消融实验：1=运行 gap_direct_top5/"
+                             "gap_score_default/gap_score_no_filters/"
+                             "gap_score_relaxed_filters/gap_score_top5_candidate/"
+                             "stat_miss_bonus/rf_stat/random 全部变体")
     args = parser.parse_args()
 
     if args.name != "dlt":
@@ -1239,7 +1263,6 @@ def main():
         if _rf_ab is not None:
             # 预检：用少量历史数据测试 RF 是否能正常预测
             try:
-                from inference_plus import predict_rf_scores
                 _test_hist = data_asc.iloc[:200]
                 _ = predict_rf_scores(_rf_ab, _test_hist, (10, 30, 100), 120)
                 logger.info("消融实验：RF 模型已加载并通过预检，将运行 rf_only 和 rf_stat")
@@ -1274,7 +1297,92 @@ def main():
     all_results = []
     main_result = None  # will point to stat_miss_penalty or stat_only for comparison
 
-    if int(args.gap_experiment) == 1:
+    if int(args.filter_experiment) == 1:
+        # ================================================================
+        #  组合过滤消融实验：判断哪一环节削弱了 gap 信号
+        # ================================================================
+        logger.info("=" * 60)
+        logger.info("组合过滤消融实验：测试 top_n/rule_filters/combos 的影响...")
+
+        # 加载 RF（如需要）
+        _rf_fe, _rf_meta_fe = maybe_load_rf_model()
+        _rf_ok_fe = False
+        if _rf_fe is not None:
+            try:
+                _ = predict_rf_scores(_rf_fe, data_asc.iloc[:200], (10, 30, 100), 120)
+                _rf_ok_fe = True
+                logger.info("Filter 实验：RF 模型已加载并通过预检")
+            except Exception as _e:
+                logger.error("RF pre-check fail: {}".format(_e))
+        else:
+            logger.warning("RF 模型不可用，将跳过 rf_stat")
+
+        # 规则定义
+        _default_rules = dict(strategy["rule_filters"])
+        _no_filters = {"odd_min": 0, "odd_max": 5, "big_min": 0, "big_max": 5,
+                       "sum_min": 15, "sum_max": 170, "max_overlap_with_last": 5}
+        _relaxed = {"odd_min": 0, "odd_max": 5, "big_min": 0, "big_max": 5,
+                    "sum_min": 30, "sum_max": 145, "max_overlap_with_last": 3}
+
+        _filter_variants = [
+            ("gap_direct_top5", None, None, None, None, None),
+            ("gap_score_default", "gap_only", 10, _default_rules, "none",
+             {"lstm": 0.0, "rf": 0.0, "stat": 1.0}),
+            ("gap_score_no_filters", "gap_only", 10, _no_filters, "none",
+             {"lstm": 0.0, "rf": 0.0, "stat": 1.0}),
+            ("gap_score_relaxed_filters", "gap_only", 10, _relaxed, "none",
+             {"lstm": 0.0, "rf": 0.0, "stat": 1.0}),
+            ("gap_score_top5_candidate", "gap_only", 5, _default_rules, "none",
+             {"lstm": 0.0, "rf": 0.0, "stat": 1.0}),
+            ("stat_miss_bonus_default", "stat_miss_bonus", 10, _default_rules, "none",
+             {"lstm": 0.0, "rf": 0.0, "stat": 1.0}),
+        ]
+        if _rf_ok_fe:
+            _filter_variants.append(
+                ("rf_stat_default", "stat_miss_penalty", 10, _default_rules, "static",
+                 {"lstm": 0.0, "rf": 0.65, "stat": 0.35}),
+            )
+
+        for _name, _smode, _tn, _rules, _rfm, _w in _filter_variants:
+            logger.info("--- {} ---".format(_name))
+            if _name == "gap_direct_top5":
+                # 使用与 gap_score 一致的评分函数而非 run_gap_only_baseline
+                # (run_gap_only_baseline 使用 calc_front_missing 的 argsort 平局，
+                #  与 _compute_gap_only_scores 的 +n/1000 平局策略不同)
+                result = run_backtest_core(
+                    data_asc=data_asc, start_idx=start_idx, end_idx=end_idx,
+                    top_n_front=5,
+                    max_front_combos=1,
+                    play_front_combos=1,
+                    ensemble_weights={"lstm": 0.0, "rf": 0.0, "stat": 1.0},
+                    rule_filters={"odd_min": 0, "odd_max": 5, "big_min": 0,
+                                  "big_max": 5, "sum_min": 15, "sum_max": 170,
+                                  "max_overlap_with_last": 5},
+                    rf_mode="none",
+                    score_mode="gap_only",
+                    strategy_name="gap_direct_top5",
+                )
+            else:
+                _rf_use = _rf_fe if _rfm == "static" else None
+                _rf_meta_use = _rf_meta_fe if _rfm == "static" else {"min_history": 120}
+                result = run_backtest_core(
+                    data_asc=data_asc, start_idx=start_idx, end_idx=end_idx,
+                    top_n_front=_tn,
+                    max_front_combos=strategy["max_front_combos"],
+                    play_front_combos=int(strategy.get("play_front_combos", 1)),
+                    ensemble_weights=_w,
+                    rule_filters=_rules,
+                    rf_mode=_rfm, rf_model_static=_rf_use,
+                    rf_meta=_rf_meta_use,
+                    score_mode=_smode,
+                    strategy_name=_name,
+                )
+            _log_strategy_metrics(result)
+            all_results.append(result)
+            if _name == "gap_direct_top5":
+                main_result = result
+
+    elif int(args.gap_experiment) == 1:
         # ================================================================
         #  Gap 方向实验：测试遗漏值的不同处理方式
         # ================================================================
@@ -1286,13 +1394,12 @@ def main():
         _rf_ok = False
         if _rf_gap is not None:
             try:
-                from inference_plus import predict_rf_scores
                 _test_hist = data_asc.iloc[:200]
                 _ = predict_rf_scores(_rf_gap, _test_hist, (10, 30, 100), 120)
                 _rf_ok = True
                 logger.info("Gap 实验：RF 模型已加载并通过预检")
             except Exception as _e:
-                logger.error("RF 预检失败，跳过 rf_stat/rf_stat_gap: {}".format(_e))
+                logger.error("RF pre-check fail, skip rf_stat/rf_stat_gap: {}".format(_e))
         else:
             logger.warning("RF 模型不可用，将跳过 rf_stat 和 rf_stat_gap")
 
@@ -1501,7 +1608,14 @@ def main():
                 # 实验模式：为每个非 baseline 策略变体计算 percentile
                 _pct_targets = [main_result] if main_result is not None else []
                 _extra_names = set()
-                if int(args.gap_experiment) == 1:
+                if int(args.filter_experiment) == 1:
+                    _extra_names = {"gap_score_default",
+                                    "gap_score_no_filters",
+                                    "gap_score_relaxed_filters",
+                                    "gap_score_top5_candidate",
+                                    "stat_miss_bonus_default",
+                                    "rf_stat_default", "gap_only", "hot_number"}
+                elif int(args.gap_experiment) == 1:
                     _extra_names = {"stat_no_miss", "stat_miss_bonus",
                                     "rf_stat", "rf_stat_gap",
                                     "gap_score", "gap_only", "hot_number"}
