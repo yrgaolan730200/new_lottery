@@ -1142,6 +1142,21 @@ def save_grid_results(results, out_path):
 #  日志辅助
 # ============================================================
 
+def _extract_window_row(result, window_id, start_issue, end_issue):
+    """从策略结果中提取滚动窗口所需的关键指标。"""
+    return {
+        "window_id": window_id,
+        "window_start_issue": start_issue,
+        "window_end_issue": end_issue,
+        "strategy_name": result.get("strategy_name", "unknown"),
+        "roi_truncated": result.get("roi_truncated", 0.0),
+        "avg_front_hit": result.get("avg_front_hit", 0.0),
+        "hit2_or_more_rate": result.get("hit2_or_more_rate", 0.0),
+        "hit3_or_more_rate": result.get("hit3_or_more_rate", 0.0),
+        "max_consecutive_loss": result.get("max_consecutive_loss", 0),
+    }
+
+
 def _log_strategy_metrics(r, prefix="  "):
     """统一格式打印策略指标。"""
     logger.info("{}profit={:>8d}  roi={:>8.4f}  roi_t={:>8.4f}  "
@@ -1199,6 +1214,14 @@ def main():
                              "gap_score_default/gap_score_no_filters/"
                              "gap_score_relaxed_filters/gap_score_top5_candidate/"
                              "stat_miss_bonus/rf_stat/random 全部变体")
+    parser.add_argument("--rolling_stability", default=0, type=int,
+                        help="滚动窗口稳定性验证：1=启用")
+    parser.add_argument("--rolling_window", default=200, type=int,
+                        help="滚动窗口大小（默认200期）")
+    parser.add_argument("--rolling_step", default=100, type=int,
+                        help="滚动窗口步长（默认100期）")
+    parser.add_argument("--rolling_random_trials", default=100, type=int,
+                        help="每个滚动窗口中random基线的trial数")
     args = parser.parse_args()
 
     if args.name != "dlt":
@@ -1296,6 +1319,176 @@ def main():
     # --- 运行策略回测 ---
     all_results = []
     main_result = None  # will point to stat_miss_penalty or stat_only for comparison
+
+    if int(args.rolling_stability) == 1:
+        # ================================================================
+        #  滚动窗口稳定性验证
+        # ================================================================
+        _wsize = int(args.rolling_window)
+        _wstep = int(args.rolling_step)
+        _rw_trials = int(args.rolling_random_trials)
+        logger.info("=" * 60)
+        logger.info("滚动窗口稳定性验证: window={}, step={}".format(_wsize, _wstep))
+
+        _rf_rw, _rf_meta_rw = maybe_load_rf_model()
+        _rf_ok_rw = False
+        _rf_train_end = None
+        if _rf_rw is not None:
+            try:
+                _ = predict_rf_scores(_rf_rw, data_asc.iloc[:200], (10, 30, 100), 120)
+                _rf_ok_rw = True
+                _rf_train_end = (_rf_meta_rw.get("train_issue_end") if _rf_meta_rw else None)
+                logger.info("Rolling: RF loaded, train_end={}".format(_rf_train_end))
+            except Exception as _e:
+                logger.warning("Rolling: RF pre-check fail, skip rf_stat: {}".format(_e))
+
+        _rw_results = []
+        _min_start = 121
+        _max_start = len(data_asc) - _wsize
+
+        for _wstart in range(_min_start, _max_start + 1, _wstep):
+            _wend = _wstart + _wsize - 1
+            _wstart_issue = int(data_asc.iloc[_wstart]["期数"])
+            _wend_issue = int(data_asc.iloc[_wend]["期数"])
+            _wid = (_wstart - _min_start) // _wstep + 1
+
+            logger.info("--- Window {}: {} → {} (idx {}→{}) ---".format(
+                _wid, _wstart_issue, _wend_issue, _wstart, _wend))
+
+            _common = dict(
+                data_asc=data_asc, start_idx=_wstart, end_idx=_wend,
+                max_front_combos=strategy["max_front_combos"],
+                play_front_combos=int(strategy.get("play_front_combos", 1)),
+            )
+            _no_filters = {"odd_min": 0, "odd_max": 5, "big_min": 0, "big_max": 5,
+                           "sum_min": 15, "sum_max": 170, "max_overlap_with_last": 5}
+            _def_rules = dict(strategy["rule_filters"])
+
+            # A) gap_direct_top5
+            _r = run_backtest_core(
+                **_common, top_n_front=5,
+                ensemble_weights={"lstm": 0, "rf": 0, "stat": 1},
+                rule_filters=_no_filters,
+                rf_mode="none", score_mode="gap_only",
+                strategy_name="gap_direct_top5",
+            )
+            _rw_results.append(_extract_window_row(_r, _wid, _wstart_issue, _wend_issue))
+
+            # B) stat_miss_bonus
+            _r = run_backtest_core(
+                **_common, top_n_front=10,
+                ensemble_weights={"lstm": 0, "rf": 0, "stat": 1},
+                rule_filters=_def_rules,
+                rf_mode="none", score_mode="stat_miss_bonus",
+                strategy_name="stat_miss_bonus",
+            )
+            _rw_results.append(_extract_window_row(_r, _wid, _wstart_issue, _wend_issue))
+
+            # C) rf_stat (仅当 RF 可用且无泄漏)
+            _rf_safe = (_rf_ok_rw and _rf_train_end is not None
+                        and _rf_train_end < _wstart_issue)
+            if _rf_safe:
+                _r = run_backtest_core(
+                    **_common, top_n_front=10,
+                    ensemble_weights={"lstm": 0, "rf": 0.65, "stat": 0.35},
+                    rule_filters=_def_rules,
+                    rf_mode="static", rf_model_static=_rf_rw,
+                    rf_meta=_rf_meta_rw,
+                    score_mode="stat_miss_penalty",
+                    strategy_name="rf_stat",
+                )
+                _rw_results.append(_extract_window_row(_r, _wid, _wstart_issue, _wend_issue))
+            else:
+                logger.info("  rf_stat: SKIP (RF unavailable or leakage risk)")
+                _rw_results.append({
+                    "window_id": _wid,
+                    "window_start_issue": _wstart_issue,
+                    "window_end_issue": _wend_issue,
+                    "strategy_name": "rf_stat",
+                    "roi_truncated": None, "avg_front_hit": None,
+                    "hit2_or_more_rate": None, "hit3_or_more_rate": None,
+                    "max_consecutive_loss": None,
+                    "skipped_reason": "leakage_risk_rf_train_end_ge_window_start",
+                })
+
+            # D) random
+            _r = run_random_baseline(
+                data_asc, _wstart, _wend,
+                n_trials=_rw_trials,
+                rng_seed=42 + _wid,
+            )
+            _rw_results.append(_extract_window_row(_r, _wid, _wstart_issue, _wend_issue))
+
+        # 保存
+        _rw_df = pd.DataFrame(_rw_results)
+        _rw_csv = os.path.join("outputs", "rolling_window_summary.csv")
+        _rw_json = os.path.join("outputs", "rolling_window_summary.json")
+        out_dir = os.path.dirname(_rw_csv)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        _rw_df.to_csv(_rw_csv, index=False, encoding="utf-8-sig")
+        with open(_rw_json, "w", encoding="utf-8") as f:
+            json.dump(_rw_results, f, ensure_ascii=False, indent=2)
+        logger.info("滚动窗口已保存: {} / {}".format(_rw_csv, _rw_json))
+
+        # 排名统计
+        _rankings = {}
+        for _col in ["roi_truncated", "avg_front_hit",
+                     "hit2_or_more_rate", "hit3_or_more_rate"]:
+            _best = _rw_df.loc[_rw_df.groupby("window_id")[_col].idxmax()]
+            _counts = _best["strategy_name"].value_counts().to_dict()
+            _rankings[_col + "_champion"] = _counts
+
+        # 超过 random 均值的窗口数
+        _rand_mean = _rw_df[_rw_df["strategy_name"] == "random"].groupby(
+            "window_id")["roi_truncated"].mean()
+        for _sn in ["gap_direct_top5", "stat_miss_bonus", "rf_stat"]:
+            _sub = _rw_df[_rw_df["strategy_name"] == _sn]
+            _above = sum(1 for _, _row in _sub.iterrows()
+                         if _row["roi_truncated"] > _rand_mean.get(_row["window_id"], -99))
+            _rankings[_sn + "_above_random_mean"] = int(_above)
+
+        # rf_stat 有效/跳过（排除 None 值的跳过行）
+        _rf_valid = len(_rw_df[(_rw_df["strategy_name"] == "rf_stat") &
+                               (_rw_df["roi_truncated"].notna())])
+        _rf_total = _wid
+        _rankings["rf_stat_valid_windows"] = int(_rf_valid)
+        _rankings["rf_stat_skipped_windows"] = _rf_total - int(_rf_valid)
+
+        _rankings_path = os.path.join("outputs", "rolling_window_rankings.json")
+        with open(_rankings_path, "w", encoding="utf-8") as f:
+            json.dump(_rankings, f, ensure_ascii=False, indent=2)
+        logger.info("排名统计已保存: {}".format(_rankings_path))
+
+        # 冠军统计
+        logger.info("=" * 60)
+        logger.info("滚动窗口冠军统计 ({} 窗口)".format(_wid))
+        for _col in ["roi_truncated", "avg_front_hit",
+                     "hit2_or_more_rate", "hit3_or_more_rate"]:
+            _counts = _rankings.get(_col + "_champion", {})
+            logger.info("  {} 冠军:".format(_col))
+            for _sn, _cnt in sorted(_counts.items(), key=lambda x: -x[1]):
+                logger.info("    {}: {}/{}".format(_sn, _cnt, _wid))
+
+        # 跨窗口稳定性
+        logger.info("--- 跨窗口均值±std ---")
+        for _sn in _rw_df["strategy_name"].unique():
+            _sub = _rw_df[_rw_df["strategy_name"] == _sn]
+            logger.info("  {:>24s}: roi_t={:.4f}±{:.4f}  hit3+={:.4f}±{:.4f}".format(
+                _sn,
+                _sub["roi_truncated"].mean(), _sub["roi_truncated"].std(),
+                _sub["hit3_or_more_rate"].mean(), _sub["hit3_or_more_rate"].std(),
+            ))
+        logger.info("  超过 random roi_t 均值:")
+        for _sn in ["gap_direct_top5", "stat_miss_bonus", "rf_stat"]:
+            _key = _sn + "_above_random_mean"
+            logger.info("    {}: {}/{}".format(_sn, _rankings.get(_key, 0), _wid))
+        logger.info("  rf_stat 有效/跳过: {}/{}".format(
+            _rankings.get("rf_stat_valid_windows", 0),
+            _rankings.get("rf_stat_skipped_windows", 0)))
+
+        logger.info("滚动窗口验证完成")
+        return
 
     if int(args.filter_experiment) == 1:
         # ================================================================
