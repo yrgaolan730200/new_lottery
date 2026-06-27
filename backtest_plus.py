@@ -1142,6 +1142,178 @@ def save_grid_results(results, out_path):
 #  日志辅助
 # ============================================================
 
+# ============================================================
+#  9候选池生成器 (P2-1)
+# ============================================================
+
+N9_PROFILES = {
+    "n9_mix_441": {"stat_miss_bonus": 4, "rf_stat": 4, "gap_direct_top5": 1},
+    "n9_mix_531": {"stat_miss_bonus": 5, "rf_stat": 3, "gap_direct_top5": 1},
+    "n9_mix_621": {"stat_miss_bonus": 6, "rf_stat": 2, "gap_direct_top5": 1},
+}
+
+
+def _get_ranked_by_source(hist, rf_model_static=None, rf_meta=None,
+                          score_windows=(10, 30, 100), min_history=120):
+    """计算三个来源各自的前区排序（1~35，分数从高到低）。
+
+    Returns:
+        dict: {"stat_miss_bonus": [n1, n2, ...],
+               "rf_stat": [n1, n2, ...] or None,
+               "gap_direct_top5": [n1, n2, ...]}
+    """
+    result = {}
+
+    # A) stat_miss_bonus
+    _scores_smb = _compute_stat_miss_bonus(hist, score_windows)
+    result["stat_miss_bonus"] = (np.argsort(_scores_smb)[::-1] + 1).tolist()
+
+    # B) gap_direct_top5
+    _scores_gap = _compute_gap_only_scores(hist)
+    result["gap_direct_top5"] = (np.argsort(_scores_gap)[::-1] + 1).tolist()
+
+    # C) rf_stat
+    _rf_ranked = None
+    if rf_model_static is not None and len(hist) >= min_history:
+        try:
+            _rf_scores = predict_rf_scores(rf_model_static, hist,
+                                           windows=score_windows,
+                                           min_history=min_history)
+            _stat_for_rf = _compute_stat_miss_penalty(hist, score_windows)
+            # RF:stat = 0.65:0.35 融合
+            _ensemble = 0.65 * _rf_scores + 0.35 * _stat_for_rf
+            _rf_ranked = (np.argsort(_ensemble)[::-1] + 1).tolist()
+        except Exception:
+            _rf_ranked = None
+    result["rf_stat"] = _rf_ranked
+
+    return result
+
+
+def generate_n9_candidate_pool(hist, profile_name,
+                               rf_model_static=None, rf_meta=None,
+                               score_windows=(10, 30, 100), min_history=120):
+    """按指定 profile 配额生成 9 个前区候选号。
+
+    Args:
+        hist: 截至目标期之前的历史数据 (升序 DataFrame)
+        profile_name: "n9_mix_441" / "n9_mix_531" / "n9_mix_621"
+        rf_model_static: 预训练 RF 模型（可为 None）
+        rf_meta: RF 元信息
+        score_windows: 评分窗口
+        min_history: 最小历史期数
+
+    Returns:
+        dict: {
+            "profile_name": ...,
+            "candidates": [9个号码],
+            "candidate_sources": {num: [source_names]},
+            "ranked_by_source": {...},
+            "fill_reason": "...",
+            "rf_available": bool,
+        }
+    """
+    profile = N9_PROFILES.get(profile_name)
+    if profile is None:
+        return {"profile_name": profile_name, "candidates": [],
+                "error": "unknown profile"}
+
+    ranked = _get_ranked_by_source(hist, rf_model_static, rf_meta,
+                                   score_windows, min_history)
+    rf_available = ranked["rf_stat"] is not None
+
+    # 按配额依次取号，去重
+    candidates = []
+    sources = {}
+    used = set()
+
+    source_order = ["stat_miss_bonus", "rf_stat", "gap_direct_top5"]
+    for src in source_order:
+        quota = profile.get(src, 0)
+        if quota <= 0:
+            continue
+        src_ranked = ranked.get(src)
+        if src_ranked is None:
+            continue
+        count = 0
+        # 第一遍：收集唯一号码以满足配额
+        for n in src_ranked:
+            _key = str(n).zfill(2)
+            if n not in used:
+                candidates.append(n)
+                used.add(n)
+                sources.setdefault(_key, []).append(src)
+                count += 1
+            else:
+                # 号码已被前面来源选中，追加当前来源到 sources
+                if src not in sources.get(_key, []):
+                    sources[_key].append(src)
+            if count >= quota:
+                break
+        if count < quota:
+            # 该来源不足，继续从下一轮补齐
+            for n in src_ranked:
+                _key = str(n).zfill(2)
+                if n not in used:
+                    candidates.append(n)
+                    used.add(n)
+                    sources.setdefault(_key, []).append(src + "_overflow")
+                    count += 1
+                else:
+                    if src not in sources.get(_key, []):
+                        sources[_key].append(src)
+                if count >= quota:
+                    break
+
+    # 如果不足 9 个，用综合分补齐
+    fill_reason = "quota_ok"
+    if len(candidates) < 9:
+        fill_reason = "filled_from_composite"
+        # 综合分权重 = 当前 profile 配额（动态生成）
+        composite = np.zeros(35, dtype=float)
+        _weights = {
+            "stat_miss_bonus": float(profile.get("stat_miss_bonus", 0)),
+            "rf_stat": float(profile.get("rf_stat", 0)) if rf_available else 0.0,
+            "gap_direct_top5": float(profile.get("gap_direct_top5", 0)),
+        }
+        _total_w = sum(_weights.values())
+        if _total_w > 0:
+            for src in source_order:
+                _src_ranked = ranked.get(src)
+                if _src_ranked is None:
+                    continue
+                _w = _weights[src] / _total_w
+                # 排名分：排名越前分越高
+                for _pos, _n in enumerate(_src_ranked):
+                    composite[_n - 1] += _w * (35.0 - _pos) / 35.0
+        _comp_ranked = (np.argsort(composite)[::-1] + 1).tolist()
+        for n in _comp_ranked:
+            if n not in used:
+                candidates.append(n)
+                used.add(n)
+                sources.setdefault(str(n).zfill(2), []).append("composite")
+                if len(candidates) >= 9:
+                    break
+
+    # 截断到 9 个
+    candidates = candidates[:9]
+
+    # 构建 ranked_by_source（前 10 每个来源）
+    ranked_by_source = {}
+    for src in source_order:
+        _r = ranked.get(src)
+        ranked_by_source[src] = _r[:10] if _r else []
+
+    return {
+        "profile_name": profile_name,
+        "candidates": candidates,
+        "candidate_sources": sources,
+        "ranked_by_source": ranked_by_source,
+        "fill_reason": fill_reason,
+        "rf_available": rf_available,
+    }
+
+
 def _extract_window_row(result, window_id, start_issue, end_issue):
     """从策略结果中提取滚动窗口所需的关键指标。"""
     return {
@@ -1222,6 +1394,12 @@ def main():
                         help="滚动窗口步长（默认100期）")
     parser.add_argument("--rolling_random_trials", default=100, type=int,
                         help="每个滚动窗口中random基线的trial数")
+    parser.add_argument("--n9_candidates", default=0, type=int,
+                        help="9候选池预览模式：1=启用")
+    parser.add_argument("--n9_profile", default="all", type=str,
+                        help="候选池profile: n9_mix_441 / n9_mix_531 / n9_mix_621 / all")
+    parser.add_argument("--n9_preview_last", default=5, type=int,
+                        help="预览最近N期的候选池")
     args = parser.parse_args()
 
     if args.name != "dlt":
@@ -1319,6 +1497,119 @@ def main():
     # --- 运行策略回测 ---
     all_results = []
     main_result = None  # will point to stat_miss_penalty or stat_only for comparison
+
+    if int(args.n9_candidates) == 1:
+        # ================================================================
+        #  P2-1: 9候选池预览模式
+        # ================================================================
+        _n9_last = int(args.n9_preview_last)
+        _n9_profiles = (["n9_mix_441", "n9_mix_531", "n9_mix_621"]
+                        if args.n9_profile == "all"
+                        else [args.n9_profile])
+
+        # 加载 RF
+        _rf_n9, _rf_meta_n9 = maybe_load_rf_model()
+        _rf_ok_n9 = False
+        if _rf_n9 is not None:
+            try:
+                _ = predict_rf_scores(_rf_n9, data_asc.iloc[:200], (10, 30, 100), 120)
+                _rf_ok_n9 = True
+                logger.info("N9 preview: RF loaded, train_end={}".format(
+                    _rf_meta_n9.get("train_issue_end") if _rf_meta_n9 else "?"))
+            except Exception as _e:
+                logger.warning("N9 preview: RF pre-check fail: {}".format(_e))
+
+        # 预览最近 _n9_last 期
+        _n9_rows = []
+        _n9_start = max(121, len(data_asc) - _n9_last)
+        _score_windows = (int(strategy["score_windows"]["short"]),
+                          int(strategy["score_windows"]["mid"]),
+                          int(strategy["score_windows"]["long"]))
+
+        logger.info("=" * 60)
+        logger.info("9候选池预览: 最近 {} 期, profiles={}".format(
+            _n9_last, _n9_profiles))
+
+        for _idx in range(_n9_start, len(data_asc)):
+            _hist = data_asc.iloc[:_idx]
+            _target = data_asc.iloc[_idx]
+            _issue = int(_target["期数"])
+            _actual = sorted([int(_target[c]) for c in FRONT_COLS])
+
+            for _prof in _n9_profiles:
+                _pool = generate_n9_candidate_pool(
+                    _hist, _prof,
+                    rf_model_static=_rf_n9 if _rf_ok_n9 else None,
+                    rf_meta=_rf_meta_n9,
+                    score_windows=_score_windows,
+                )
+                _cands = _pool["candidates"]
+                _hit_count = len(set(_cands).intersection(set(_actual)))
+                _n9_rows.append({
+                    "issue": _issue,
+                    "profile_name": _prof,
+                    "candidates": _cands,
+                    "candidate_count": len(_cands),
+                    "actual_front": _actual,
+                    "hit_in_pool": _hit_count,
+                    "stat_top": _pool["ranked_by_source"].get("stat_miss_bonus", [])[:5],
+                    "rf_top": _pool["ranked_by_source"].get("rf_stat", [])[:5],
+                    "gap_top": _pool["ranked_by_source"].get("gap_direct_top5", [])[:5],
+                    "candidate_sources": _pool.get("candidate_sources", {}),
+                    "fill_reason": _pool.get("fill_reason", ""),
+                    "rf_available": _pool.get("rf_available", False),
+                })
+                logger.info("  Issue {} | {}: candidates={} hit={}/9 actual={}".format(
+                    _issue, _prof, _cands, _hit_count, _actual))
+
+        # 保存
+        _n9_df = pd.DataFrame(_n9_rows)
+        _n9_csv = os.path.join("outputs", "n9_candidate_pool_preview.csv")
+        _n9_json = os.path.join("outputs", "n9_candidate_pool_preview.json")
+        out_dir = os.path.dirname(_n9_csv)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        _n9_df.to_csv(_n9_csv, index=False, encoding="utf-8-sig")
+        with open(_n9_json, "w", encoding="utf-8") as f:
+            json.dump(_n9_rows, f, ensure_ascii=False, indent=2)
+        logger.info("候选池预览已保存: {} / {}".format(_n9_csv, _n9_json))
+
+        # 摘要
+        logger.info("--- 候选池预览摘要 ---")
+        for _prof in _n9_profiles:
+            _sub = _n9_df[_n9_df["profile_name"] == _prof]
+            _all9 = (_sub["candidate_count"] == 9).all()
+            _avg_hit = _sub["hit_in_pool"].mean()
+            logger.info("  {}: all_9={}, avg_hit_in_pool={:.2f}".format(
+                _prof, _all9, _avg_hit))
+        logger.info("RF available: {}".format(_rf_ok_n9))
+
+        # 自检
+        _errors = 0
+        for _i, _row in enumerate(_n9_rows):
+            _cands = _row["candidates"]
+            _issue = _row["issue"]
+            _prof = _row["profile_name"]
+            if len(_cands) != 9:
+                logger.warning("SELF-CHECK FAIL: Issue {} {} candidate_count={}".format(
+                    _issue, _prof, len(_cands)))
+                _errors += 1
+            if len(set(_cands)) != len(_cands):
+                logger.warning("SELF-CHECK FAIL: Issue {} {} has duplicates: {}".format(
+                    _issue, _prof, _cands))
+                _errors += 1
+            for _n in _cands:
+                if _n < 1 or _n > 35:
+                    logger.warning("SELF-CHECK FAIL: Issue {} {} num {} out of range".format(
+                        _issue, _prof, _n))
+                    _errors += 1
+        if _errors == 0:
+            logger.info("自检通过: {}行全部合法".format(len(_n9_rows)))
+        else:
+            logger.warning("自检发现 {} 个问题".format(_errors))
+
+        logger.info("9候选池预览完成")
+        return
 
     if int(args.rolling_stability) == 1:
         # ================================================================
