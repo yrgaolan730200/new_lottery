@@ -1314,6 +1314,213 @@ def generate_n9_candidate_pool(hist, profile_name,
     }
 
 
+# ============================================================
+#  3组5+12启发式缩水 (P2-2)
+# ============================================================
+
+def generate_3x5_from_n9_pool(candidates, ranked_by_source=None,
+                               profile_name=None, candidate_sources=None,
+                               method="greedy_triple_coverage"):
+    """从 9 个候选号生成 3 组前区 5 码。
+
+    核心算法：贪心最大化高价值三元组覆盖。
+    每轮从 C(9,5)=126 个组合中选择一个，综合考虑：
+    - 新增三元组覆盖收益（优先覆盖高权重三元组）
+    - 号码多样性（鼓励 9 个候选号都至少出现一次）
+    - 重叠惩罚（避免三组几乎一样）
+    - 形态惩罚（全奇/全偶/连号/极端和值轻微惩罚）
+
+    Args:
+        candidates: 9 个唯一前区候选号
+        ranked_by_source: {src: [ranked_numbers]} 各来源排序
+        profile_name: profile 名称
+        candidate_sources: {num: [sources]} 号码来源
+        method: 算法名
+
+    Returns:
+        dict: groups, coverage_stats, candidate_occurrence, ...
+    """
+    from itertools import combinations as iter_combos
+
+    # 规范化：内部统一使用升序，确保 triple key 一致
+    candidates = sorted(list(candidates))
+    n_cand = len(candidates)
+    if n_cand < 9:
+        return {"groups": [], "error": "need 9 candidates, got {}".format(n_cand)}
+
+    def _tkey(t):
+        """将三元组规范化为升序 tuple，确保 key 一致性。"""
+        return tuple(sorted(t))
+
+    cand_set = set(candidates)
+
+    # 1. 计算 number_score
+    _profile = N9_PROFILES.get(profile_name, N9_PROFILES["n9_mix_441"])
+    number_score = {}
+    if ranked_by_source:
+        src_weights = {
+            "stat_miss_bonus": _profile.get("stat_miss_bonus", 4) / 9.0,
+            "rf_stat": _profile.get("rf_stat", 4) / 9.0,
+            "gap_direct_top5": _profile.get("gap_direct_top5", 1) / 9.0,
+        }
+        # 如果某来源不可用，重新归一化
+        _avail = [s for s in src_weights if ranked_by_source.get(s)]
+        _total_w = sum(src_weights[s] for s in _avail)
+        if _total_w > 0:
+            for s in _avail:
+                src_weights[s] /= _total_w
+
+        for n in candidates:
+            score = 0.0
+            for src, weight in src_weights.items():
+                ranked_list = ranked_by_source.get(src)
+                if ranked_list and n in ranked_list:
+                    pos = ranked_list.index(n)
+                    # 排名越前分越高 (35-pos)/35
+                    score += weight * (35.0 - pos) / 35.0
+            number_score[n] = score
+    else:
+        for n in candidates:
+            number_score[n] = 1.0
+
+    # 2. 计算 triple_weight (84 个三元组，统一 sorted key)
+    triple_weight = {}
+    for t in iter_combos(candidates, 3):
+        _k = _tkey(t)
+        triple_weight[_k] = sum(number_score[n] for n in _k) / 3.0
+
+    # 3. 枚举 126 个五码组合
+    all_combos = list(iter_combos(candidates, 5))
+
+    def combo_shape_penalty(combo):
+        """轻微形态惩罚（不硬过滤）。"""
+        combo = sorted(combo)
+        p = 0.0
+        odd = sum(n % 2 for n in combo)
+        if odd == 0 or odd == 5:
+            p += 0.03  # 全奇或全偶
+        big = sum(n > 17 for n in combo)
+        if big == 0 or big == 5:
+            p += 0.03
+        total = sum(combo)
+        if total < 30 or total > 160:
+            p += 0.05
+        consecutive = sum(1 for i in range(1, len(combo))
+                          if combo[i] - combo[i - 1] == 1)
+        if consecutive >= 3:
+            p += 0.05
+        return p
+
+    # 4. 贪心选择 3 组
+    selected_groups = []
+    covered_triples = set()       # 已覆盖三元组
+    weighted_covered = 0.0        # 已覆盖加权三元组
+    total_triples = len(triple_weight)
+    total_weighted = sum(triple_weight.values())
+    # 自检
+    if total_triples != 84:
+        logger.warning("triple_weight size={}, expected 84".format(total_triples))
+    if total_weighted <= 0:
+        logger.warning("triple_weight total=0, scores may be broken")
+    num_occurrence = {n: 0 for n in candidates}
+    trace = []
+
+    for round_idx in range(3):
+        best_combo = None
+        best_score = -1e9
+
+        for combo in all_combos:
+            # 该组合覆盖的三元组（统一 sorted key）
+            triples_in_combo = set()
+            for t in iter_combos(sorted(combo), 3):
+                triples_in_combo.add(_tkey(t))
+
+            # 新增三元组覆盖
+            new_triples = triples_in_combo - covered_triples
+            new_weighted = sum(triple_weight.get(t, 0) for t in new_triples)
+            new_count = len(new_triples)
+
+            # 号码覆盖收益
+            diversity_bonus = 0.0
+            for n in combo:
+                if num_occurrence[n] == 0:
+                    diversity_bonus += 0.05  # 首次出现加分
+
+            # 重叠惩罚
+            overlap_penalty = 0.0
+            for prev in selected_groups:
+                shared = len(set(combo).intersection(set(prev)))
+                if shared >= 4:
+                    overlap_penalty += 0.15
+                elif shared >= 3:
+                    overlap_penalty += 0.05
+
+            # 形态惩罚
+            shape_penalty = combo_shape_penalty(combo)
+
+            # 组合评分
+            score = (new_weighted / max(total_weighted, 0.001) * 0.50 +
+                     new_count / max(total_triples, 1) * 0.25 +
+                     diversity_bonus * 0.15 -
+                     overlap_penalty * 0.10 -
+                     shape_penalty)
+
+            if score > best_score:
+                best_score = score
+                best_combo = combo
+
+        if best_combo is None:
+            break
+
+        selected_groups.append(sorted(best_combo))
+        for n in best_combo:
+            num_occurrence[n] += 1
+
+        # 计算本轮新增三元组（剔除已覆盖的，统一 sorted key）
+        _best_triples = [_tkey(t) for t in iter_combos(sorted(best_combo), 3)]
+        _new_this_round = [t for t in _best_triples if t not in covered_triples]
+        _new_weighted = sum(triple_weight.get(t, 0) for t in _new_this_round)
+        for t in _new_this_round:
+            covered_triples.add(t)
+        weighted_covered += _new_weighted
+
+        trace.append({
+            "round": round_idx + 1,
+            "selected": sorted(best_combo),
+            "score": round(best_score, 6),
+            "new_triples": len(_new_this_round),
+            "new_weighted": round(_new_weighted, 4),
+            "cumulative_covered_triples": len(covered_triples),
+            "cumulative_coverage_ratio": round(
+                len(covered_triples) / total_triples, 4
+            ) if total_triples > 0 else 0,
+        })
+
+    # 5. 构建返回
+    groups = [list(g) for g in selected_groups]
+    coverage_ratio = len(covered_triples) / total_triples if total_triples > 0 else 0
+    weighted_ratio = weighted_covered / total_weighted if total_weighted > 0 else 0
+
+    return {
+        "groups": groups,
+        "method": method,
+        "front_group_count": len(groups),
+        "backend_full_cover": True,
+        "cost_per_group": 132,
+        "total_cost": len(groups) * 132,
+        "coverage_stats": {
+            "total_triples": total_triples,
+            "covered_triples": len(covered_triples),
+            "coverage_ratio": round(coverage_ratio, 4),
+            "weighted_covered_triples": round(weighted_covered, 4),
+            "weighted_coverage_ratio": round(weighted_ratio, 4),
+        },
+        "candidate_occurrence": {str(n).zfill(2): num_occurrence[n]
+                                  for n in candidates},
+        "selection_trace": trace,
+    }
+
+
 def _extract_window_row(result, window_id, start_issue, end_issue):
     """从策略结果中提取滚动窗口所需的关键指标。"""
     return {
@@ -1400,6 +1607,11 @@ def main():
                         help="候选池profile: n9_mix_441 / n9_mix_531 / n9_mix_621 / all")
     parser.add_argument("--n9_preview_last", default=5, type=int,
                         help="预览最近N期的候选池")
+    parser.add_argument("--n9_3x_preview", default=0, type=int,
+                        help="3组5+12预览模式：1=启用")
+    parser.add_argument("--n9_combo_method", default="greedy_triple_coverage",
+                        type=str,
+                        help="3组组合方法：greedy_triple_coverage")
     args = parser.parse_args()
 
     if args.name != "dlt":
@@ -1498,7 +1710,7 @@ def main():
     all_results = []
     main_result = None  # will point to stat_miss_penalty or stat_only for comparison
 
-    if int(args.n9_candidates) == 1:
+    if int(args.n9_candidates) == 1 or int(args.n9_3x_preview) == 1:
         # ================================================================
         #  P2-1: 9候选池预览模式
         # ================================================================
@@ -1559,29 +1771,70 @@ def main():
                     "fill_reason": _pool.get("fill_reason", ""),
                     "rf_available": _pool.get("rf_available", False),
                 })
-                logger.info("  Issue {} | {}: candidates={} hit={}/9 actual={}".format(
-                    _issue, _prof, _cands, _hit_count, _actual))
+
+                # 如果启用 3x5 preview，生成 3 组前区
+                if int(args.n9_3x_preview) == 1:
+                    _combo_result = generate_3x5_from_n9_pool(
+                        _cands,
+                        ranked_by_source=_pool.get("ranked_by_source"),
+                        profile_name=_prof,
+                        candidate_sources=_pool.get("candidate_sources"),
+                        method=args.n9_combo_method,
+                    )
+                    _groups = _combo_result.get("groups", [])
+                    _max_hit = 0
+                    _any_hit3 = False
+                    for _g in _groups:
+                        _gh = len(set(_g).intersection(set(_actual)))
+                        _max_hit = max(_max_hit, _gh)
+                        if _gh >= 3:
+                            _any_hit3 = True
+                    _n9_rows[-1].update({
+                        "groups": _groups,
+                        "group_count": _combo_result.get("front_group_count", 0),
+                        "total_cost": _combo_result.get("total_cost", 0),
+                        "coverage_ratio": _combo_result["coverage_stats"]["coverage_ratio"],
+                        "weighted_coverage_ratio": _combo_result["coverage_stats"]["weighted_coverage_ratio"],
+                        "candidate_occurrence": _combo_result.get("candidate_occurrence", {}),
+                        "max_group_front_hit": _max_hit,
+                        "any_group_hit3": _any_hit3,
+                        "method": _combo_result.get("method", ""),
+                        "selection_trace": _combo_result.get("selection_trace", []),
+                    })
+                    logger.info("  Issue {} | {}: groups={} max_hit={} any3={}".format(
+                        _issue, _prof, _groups, _max_hit, _any_hit3))
+                else:
+                    logger.info("  Issue {} | {}: candidates={} hit={}/9 actual={}".format(
+                        _issue, _prof, _cands, _hit_count, _actual))
 
         # 保存
         _n9_df = pd.DataFrame(_n9_rows)
-        _n9_csv = os.path.join("outputs", "n9_candidate_pool_preview.csv")
-        _n9_json = os.path.join("outputs", "n9_candidate_pool_preview.json")
+        _is_3x = int(args.n9_3x_preview) == 1
+        _prefix = "n9_3x5plus12" if _is_3x else "n9_candidate_pool"
+        _n9_csv = os.path.join("outputs", "{}_preview.csv".format(_prefix))
+        _n9_json = os.path.join("outputs", "{}_preview.json".format(_prefix))
         out_dir = os.path.dirname(_n9_csv)
         if out_dir and not os.path.exists(out_dir):
             os.makedirs(out_dir)
         _n9_df.to_csv(_n9_csv, index=False, encoding="utf-8-sig")
         with open(_n9_json, "w", encoding="utf-8") as f:
             json.dump(_n9_rows, f, ensure_ascii=False, indent=2)
-        logger.info("候选池预览已保存: {} / {}".format(_n9_csv, _n9_json))
+        logger.info("预览已保存: {} / {}".format(_n9_csv, _n9_json))
 
         # 摘要
-        logger.info("--- 候选池预览摘要 ---")
+        logger.info("--- 预览摘要 ---")
         for _prof in _n9_profiles:
             _sub = _n9_df[_n9_df["profile_name"] == _prof]
             _all9 = (_sub["candidate_count"] == 9).all()
             _avg_hit = _sub["hit_in_pool"].mean()
-            logger.info("  {}: all_9={}, avg_hit_in_pool={:.2f}".format(
-                _prof, _all9, _avg_hit))
+            _info = "all_9={}, avg_hit_in_pool={:.2f}".format(_all9, _avg_hit)
+            if _is_3x:
+                _max_hits = _sub["max_group_front_hit"].tolist()
+                _any3s = _sub["any_group_hit3"].tolist()
+                _coverages = _sub["coverage_ratio"].tolist()
+                _info += ", max_hits={}, any3={}, cov={}".format(
+                    _max_hits, _any3s, [round(c, 3) for c in _coverages])
+            logger.info("  {}: {}".format(_prof, _info))
         logger.info("RF available: {}".format(_rf_ok_n9))
 
         # 自检
@@ -1590,25 +1843,63 @@ def main():
             _cands = _row["candidates"]
             _issue = _row["issue"]
             _prof = _row["profile_name"]
+            _cs = set(_cands)
             if len(_cands) != 9:
                 logger.warning("SELF-CHECK FAIL: Issue {} {} candidate_count={}".format(
                     _issue, _prof, len(_cands)))
                 _errors += 1
-            if len(set(_cands)) != len(_cands):
+            if len(_cs) != len(_cands):
                 logger.warning("SELF-CHECK FAIL: Issue {} {} has duplicates: {}".format(
                     _issue, _prof, _cands))
                 _errors += 1
             for _n in _cands:
                 if _n < 1 or _n > 35:
-                    logger.warning("SELF-CHECK FAIL: Issue {} {} num {} out of range".format(
+                    logger.warning("SELF-CHECK FAIL: Issue {} {} num {} oob".format(
                         _issue, _prof, _n))
                     _errors += 1
+
+            if _is_3x:
+                _groups = _row.get("groups", [])
+                if len(_groups) != 3:
+                    logger.warning("SELF-CHECK FAIL: Issue {} {} group_count={}".format(
+                        _issue, _prof, len(_groups)))
+                    _errors += 1
+                _occ = _row.get("candidate_occurrence", {})
+                if sum(_occ.values()) != 15:
+                    logger.warning("SELF-CHECK FAIL: Issue {} {} occ_total={}".format(
+                        _issue, _prof, sum(_occ.values())))
+                    _errors += 1
+                for _g in _groups:
+                    if len(_g) != 5 or len(set(_g)) != 5:
+                        logger.warning("SELF-CHECK FAIL: Issue {} {} bad group {}".format(
+                            _issue, _prof, _g))
+                        _errors += 1
+                    for _n in _g:
+                        if _n not in _cs:
+                            logger.warning("SELF-CHECK FAIL: Issue {} {} num {} not in candidates".format(
+                                _issue, _prof, _n))
+                            _errors += 1
+                if _row.get("total_cost") != 396:
+                    logger.warning("SELF-CHECK FAIL: Issue {} {} cost={}".format(
+                        _issue, _prof, _row.get("total_cost")))
+                    _errors += 1
+                _cov = _row.get("coverage_ratio", -1)
+                _wcov = _row.get("weighted_coverage_ratio", -1)
+                if _cov < 0 or _cov > 0.358:
+                    logger.warning("SELF-CHECK FAIL: Issue {} {} coverage_ratio={:.4f} (max=0.357)".format(
+                        _issue, _prof, _cov))
+                    _errors += 1
+                if _wcov < 0 or _wcov > 1.0:
+                    logger.warning("SELF-CHECK FAIL: Issue {} {} weighted_coverage_ratio={:.4f}".format(
+                        _issue, _prof, _wcov))
+                    _errors += 1
+
         if _errors == 0:
             logger.info("自检通过: {}行全部合法".format(len(_n9_rows)))
         else:
             logger.warning("自检发现 {} 个问题".format(_errors))
 
-        logger.info("9候选池预览完成")
+        logger.info("预览完成")
         return
 
     if int(args.rolling_stability) == 1:
