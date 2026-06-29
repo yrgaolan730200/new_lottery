@@ -1521,6 +1521,292 @@ def generate_3x5_from_n9_pool(candidates, ranked_by_source=None,
     }
 
 
+# ============================================================
+#  n9_3x5plus12 历史回测 (P2-3)
+# ============================================================
+
+def run_n9_3x5plus12_backtest(data_asc, profile_name, periods=200,
+                               rf_model_static=None, rf_meta=None,
+                               score_windows=(10, 30, 100),
+                               combo_method="greedy_triple_coverage"):
+    """对指定 profile 执行 n9_3x5plus12 滚动历史回测。"""
+    n_total = len(data_asc)
+    start_idx = max(121, n_total - periods)
+    end_idx = n_total - 1
+    min_history = 120
+
+    strategy_cfg = plus_strategy["dlt"]
+    rf_train_end = rf_meta.get("train_issue_end") if rf_meta else None
+
+    records = []
+    total_cost = 0
+    total_reward = 0
+    rf_avail_count = 0
+    rf_unavail_count = 0
+
+    for idx in range(start_idx, end_idx + 1):
+        hist = data_asc.iloc[:idx]
+        target = data_asc.iloc[idx]
+        issue = int(target["期数"])
+        actual_front = sorted([int(target[c]) for c in FRONT_COLS])
+        target_front_set = set(actual_front)
+        target_back_set = set(int(target[c]) for c in BACK_COLS)
+
+        # RF 泄漏检查
+        _rf_ok = (rf_model_static is not None and rf_train_end is not None
+                  and rf_train_end < issue)
+        if _rf_ok:
+            rf_avail_count += 1
+        else:
+            rf_unavail_count += 1
+
+        _rf_use = rf_model_static if _rf_ok else None
+
+        # 生成候选池
+        pool = generate_n9_candidate_pool(
+            hist, profile_name,
+            rf_model_static=_rf_use,
+            rf_meta=rf_meta,
+            score_windows=score_windows,
+            min_history=min_history,
+        )
+        candidates = pool["candidates"]
+        pool_hit = len(set(candidates).intersection(target_front_set))
+
+        # 生成 3 组前区
+        combo = generate_3x5_from_n9_pool(
+            candidates,
+            ranked_by_source=pool.get("ranked_by_source"),
+            profile_name=profile_name,
+            candidate_sources=pool.get("candidate_sources"),
+            method=combo_method,
+        )
+        groups = combo.get("groups", [])
+
+        # 计算每期收益
+        period_cost = 396
+        period_reward = 0
+        max_hit = 0
+        any_h2 = False
+        any_h3 = False
+        any_h4 = False
+        any_h5 = False
+
+        for g in groups:
+            fh = len(set(g).intersection(target_front_set))
+            max_hit = max(max_hit, fh)
+            if fh >= 2:
+                any_h2 = True
+            if fh >= 3:
+                any_h3 = True
+            if fh >= 4:
+                any_h4 = True
+            if fh >= 5:
+                any_h5 = True
+            # 每组前区 + 后区全包 66 注，逐注计奖
+            for b1 in range(1, 13):
+                for b2 in range(b1 + 1, 13):
+                    bh = len({b1, b2}.intersection(target_back_set))
+                    prize = get_dlt_prize_table(issue).get((fh, bh), 0)
+                    period_reward += prize
+
+        period_profit = period_reward - period_cost
+        total_cost += period_cost
+        total_reward += period_reward
+
+        records.append({
+            "issue": issue,
+            "profile_name": profile_name,
+            "candidates": candidates,
+            "groups": groups,
+            "actual_front": actual_front,
+            "pool_hit_count": pool_hit,
+            "max_group_front_hit": max_hit,
+            "any_group_hit2": any_h2,
+            "any_group_hit3": any_h3,
+            "any_group_hit4": any_h4,
+            "any_group_hit5": any_h5,
+            "period_cost": period_cost,
+            "period_reward": period_reward,
+            "period_profit": period_profit,
+            "cumulative_profit": total_reward - total_cost,
+            "coverage_ratio": combo["coverage_stats"]["coverage_ratio"],
+            "weighted_coverage_ratio": combo["coverage_stats"]["weighted_coverage_ratio"],
+            "rf_available": _rf_ok,
+            "skipped_reason": "" if _rf_ok else "rf_unavailable_or_leakage_risk",
+        })
+
+    # 汇总
+    df = pd.DataFrame(records)
+    if len(df) == 0:
+        return {"strategy_name": profile_name, "periods": 0, "records": []}
+
+    _p = len(df)
+    _tc = int(df["period_cost"].sum())
+    _tr = int(df["period_reward"].sum())
+    _tp = int(df["period_profit"].sum())
+    _roi = _tp / _tc if _tc > 0 else 0.0
+
+    # 截断收益
+    _rw_t = np.minimum(df["period_reward"].values.astype(float), 10000.0)
+    _tr_t = int(_rw_t.sum())
+    _tp_t = int(_tr_t - _tc)
+    _roi_t = _tp_t / _tc if _tc > 0 else 0.0
+
+    cum = df["cumulative_profit"].values.astype(float)
+    peak = np.maximum.accumulate(cum)
+    max_dd = float((peak - cum).max())
+
+    _pr = df["period_profit"].values
+    max_loss = 0
+    cur = 0
+    for p in _pr:
+        if p < 0:
+            cur += 1
+            max_loss = max(max_loss, cur)
+        else:
+            cur = 0
+
+    return {
+        "strategy_name": profile_name,
+        "periods": _p,
+        "total_cost": _tc,
+        "total_reward": _tr,
+        "total_profit": _tp,
+        "roi": _roi,
+        "roi_truncated": _roi_t,
+        "avg_period_profit": _tp / _p if _p > 0 else 0.0,
+        "avg_front_hit_best_group": float(df["max_group_front_hit"].mean()),
+        "pool_hit3_or_more_rate": float((df["pool_hit_count"] >= 3).mean()),
+        "any_group_hit2_or_more_rate": float(df["any_group_hit2"].mean()),
+        "any_group_hit3_or_more_rate": float(df["any_group_hit3"].mean()),
+        "any_group_hit4_or_more_rate": float(df["any_group_hit4"].mean()),
+        "max_group_front_hit_avg": float(df["max_group_front_hit"].mean()),
+        "max_drawdown": max_dd,
+        "max_consecutive_loss": max_loss,
+        "positive_period_rate": float((df["period_profit"] > 0).mean()),
+        "rf_available_periods": rf_avail_count,
+        "rf_unavailable_periods": rf_unavail_count,
+        "records": records,
+    }
+
+
+def run_random_3x5plus12_baseline(data_asc, periods=200,
+                                   n_trials=100, rng_seed=42,
+                                   prize_table_func=get_dlt_prize_table):
+    """Random 3组5+12 基线：每期随机选 3 组前区 + 后区全包。"""
+    n_total = len(data_asc)
+    start_idx = max(121, n_total - periods)
+    end_idx = n_total - 1
+
+    all_trial_metrics = []
+    all_trial_records = []
+
+    for trial in range(n_trials):
+        rng = random.Random(rng_seed + trial * 10000)
+        records = []
+        tc = 0
+        tr = 0
+        for idx in range(start_idx, end_idx + 1):
+            target = data_asc.iloc[idx]
+            issue = int(target["期数"])
+            tf_set = set(int(target[c]) for c in FRONT_COLS)
+            tb_set = set(int(target[c]) for c in BACK_COLS)
+            af = sorted([int(target[c]) for c in FRONT_COLS])
+
+            period_cost = 396
+            period_reward = 0
+            max_hit = 0
+            any_h2 = False
+            any_h3 = False
+
+            for _g in range(3):
+                combo = sorted(rng.sample(range(1, 36), 5))
+                fh = len(set(combo).intersection(tf_set))
+                max_hit = max(max_hit, fh)
+                if fh >= 2:
+                    any_h2 = True
+                if fh >= 3:
+                    any_h3 = True
+                for b1 in range(1, 13):
+                    for b2 in range(b1 + 1, 13):
+                        bh = len({b1, b2}.intersection(tb_set))
+                        prize = prize_table_func(issue).get((fh, bh), 0)
+                        period_reward += prize
+
+            period_profit = period_reward - period_cost
+            tc += period_cost
+            tr += period_reward
+
+            records.append({
+                "issue": issue, "strategy_name": f"random_3x_trial_{trial+1}",
+                "actual_front": af,
+                # compute_strategy_metrics 兼容字段
+                "front_hit": max_hit,
+                "cost": period_cost, "reward": period_reward,
+                "profit": period_profit,
+                # n9_3x detail 统一字段
+                "period_cost": period_cost,
+                "period_reward": period_reward,
+                "period_profit": period_profit,
+                "max_group_front_hit": max_hit,
+                "any_group_hit2": any_h2, "any_group_hit3": any_h3,
+                "cumulative_profit": tr - tc,
+            })
+
+        trm = compute_strategy_metrics(records)
+        trm["strategy_name"] = "random_3x5plus12"
+        all_trial_metrics.append(trm)
+        all_trial_records.append(records)
+
+    if not all_trial_metrics:
+        return compute_strategy_metrics([])
+
+    # 合并
+    merged_df = pd.DataFrame([r for recs in all_trial_records for r in recs])
+    summary = merged_df.groupby("issue").agg({
+        "cost": "mean", "reward": "mean",
+        "profit": "mean", "front_hit": "mean",
+        "period_cost": "mean", "period_reward": "mean",
+        "period_profit": "mean", "max_group_front_hit": "mean",
+        "any_group_hit2": "mean", "any_group_hit3": "mean",
+    }).reset_index()
+    summary["strategy_name"] = "random_3x5plus12"
+    summary["cumulative_profit"] = summary["profit"].cumsum()
+
+    metric_keys = ["periods", "total_cost", "total_reward", "total_profit",
+                   "roi", "roi_truncated", "avg_front_hit", "max_drawdown",
+                   "max_consecutive_loss", "avg_period_profit", "profit_std"]
+    result = {"strategy_name": "random_3x5plus12",
+              "records": summary.to_dict("records")}
+    for key in metric_keys:
+        vals = [m.get(key, 0) for m in all_trial_metrics]
+        result[key] = float(np.mean(vals))
+
+    # 自定义指标（mean 和 std 均从 _any2_vals/_any3_vals 直接计算）
+    _any3_vals = [float((pd.DataFrame(r)["any_group_hit3"].astype(int).mean())
+                         if len(r) > 0 else 0) for r in all_trial_records]
+    _any2_vals = [float((pd.DataFrame(r)["any_group_hit2"].astype(int).mean())
+                         if len(r) > 0 else 0) for r in all_trial_records]
+    result["any_group_hit3_or_more_rate"] = float(np.mean(_any3_vals))
+    result["any_group_hit2_or_more_rate"] = float(np.mean(_any2_vals))
+    if n_trials > 1 and len(_any3_vals) > 1:
+        result["any_group_hit3_or_more_rate_std"] = float(np.std(_any3_vals, ddof=1))
+    if n_trials > 1 and len(_any2_vals) > 1:
+        result["any_group_hit2_or_more_rate_std"] = float(np.std(_any2_vals, ddof=1))
+    result["periods"] = int(round(result["periods"]))
+
+    if n_trials > 1:
+        for k in ["total_profit", "roi", "roi_truncated"]:
+            vals = [m.get(k, 0) for m in all_trial_metrics]
+            if len(vals) > 1:
+                result[k + "_std"] = float(np.std(vals, ddof=1))
+
+    result["_trial_metrics"] = all_trial_metrics
+    result["_trial_records"] = all_trial_records
+    return result
+
+
 def _extract_window_row(result, window_id, start_issue, end_issue):
     """从策略结果中提取滚动窗口所需的关键指标。"""
     return {
@@ -1612,6 +1898,14 @@ def main():
     parser.add_argument("--n9_combo_method", default="greedy_triple_coverage",
                         type=str,
                         help="3组组合方法：greedy_triple_coverage")
+    parser.add_argument("--n9_3x_backtest", default=0, type=int,
+                        help="n9_3x5plus12历史回测：1=启用")
+    parser.add_argument("--n9_3x_profiles", default="all", type=str,
+                        help="回测哪些profile: all / n9_mix_441 / ...")
+    parser.add_argument("--n9_3x_periods", default=200, type=int,
+                        help="回测最近多少期")
+    parser.add_argument("--n9_3x_random_trials", default=100, type=int,
+                        help="random_3x5plus12 baseline trial数")
     args = parser.parse_args()
 
     if args.name != "dlt":
@@ -1900,6 +2194,194 @@ def main():
             logger.warning("自检发现 {} 个问题".format(_errors))
 
         logger.info("预览完成")
+        return
+
+    if int(args.n9_3x_backtest) == 1:
+        # ================================================================
+        #  P2-3: n9_3x5plus12 三比例历史回测
+        # ================================================================
+        _bt_periods = int(args.n9_3x_periods)
+        _bt_profiles = (["n9_mix_441", "n9_mix_531", "n9_mix_621"]
+                        if args.n9_3x_profiles == "all"
+                        else [args.n9_3x_profiles])
+        _bt_trials = int(args.n9_3x_random_trials)
+        _bt_windows = (int(strategy["score_windows"]["short"]),
+                       int(strategy["score_windows"]["mid"]),
+                       int(strategy["score_windows"]["long"]))
+
+        _rf_bt, _rf_meta_bt = maybe_load_rf_model()
+        _rf_ok_bt = False
+        if _rf_bt is not None:
+            try:
+                _ = predict_rf_scores(_rf_bt, data_asc.iloc[:200], _bt_windows, 120)
+                _rf_ok_bt = True
+            except Exception as _e:
+                logger.warning("N9 backtest: RF pre-check fail: {}".format(_e))
+        if not _rf_ok_bt:
+            _rf_bt = None
+            _rf_meta_bt = None
+
+        logger.info("=" * 60)
+        logger.info("n9_3x5plus12 回测: {}期, profiles={}, random_trials={}".format(
+            _bt_periods, _bt_profiles, _bt_trials))
+
+        all_results = []
+
+        # A) n9_3x profiles
+        for _prof in _bt_profiles:
+            logger.info("--- {} ---".format(_prof))
+            _r = run_n9_3x5plus12_backtest(
+                data_asc, _prof, periods=_bt_periods,
+                rf_model_static=_rf_bt, rf_meta=_rf_meta_bt,
+                score_windows=_bt_windows,
+                combo_method=args.n9_combo_method,
+            )
+            logger.info("  profit={} roi_t={:.4f} any3={:.4f} rf_avail={}/{}".format(
+                _r["total_profit"], _r["roi_truncated"],
+                _r["any_group_hit3_or_more_rate"],
+                _r.get("rf_available_periods", 0), _bt_periods))
+            all_results.append(_r)
+
+        # B) Single-group baselines
+        _sg_start = max(121, len(data_asc) - _bt_periods)
+        _sg_end = len(data_asc) - 1
+
+        # stat_miss_bonus
+        logger.info("--- stat_miss_bonus (single) ---")
+        _r_smb = run_backtest_core(
+            data_asc=data_asc, start_idx=_sg_start, end_idx=_sg_end,
+            top_n_front=10,
+            max_front_combos=strategy["max_front_combos"],
+            play_front_combos=1,
+            ensemble_weights={"lstm": 0, "rf": 0, "stat": 1},
+            rule_filters=strategy["rule_filters"],
+            rf_mode="none", score_mode="stat_miss_bonus",
+            strategy_name="stat_miss_bonus",
+        )
+        _log_strategy_metrics(_r_smb)
+        all_results.append(_r_smb)
+
+        # gap_direct_top5
+        logger.info("--- gap_direct_top5 (single) ---")
+        _r_gap = run_backtest_core(
+            data_asc=data_asc, start_idx=_sg_start, end_idx=_sg_end,
+            top_n_front=5,
+            max_front_combos=1,
+            play_front_combos=1,
+            ensemble_weights={"lstm": 0, "rf": 0, "stat": 1},
+            rule_filters={"odd_min": 0, "odd_max": 5, "big_min": 0, "big_max": 5,
+                          "sum_min": 15, "sum_max": 170, "max_overlap_with_last": 5},
+            rf_mode="none", score_mode="gap_only",
+            strategy_name="gap_direct_top5",
+        )
+        _log_strategy_metrics(_r_gap)
+        all_results.append(_r_gap)
+
+        # rf_stat (only if available)
+        if _rf_ok_bt:
+            logger.info("--- rf_stat (single, leakage-aware) ---")
+            _r_rf = run_backtest_core(
+                data_asc=data_asc, start_idx=_sg_start, end_idx=_sg_end,
+                top_n_front=10,
+                max_front_combos=strategy["max_front_combos"],
+                play_front_combos=1,
+                ensemble_weights={"lstm": 0, "rf": 0.65, "stat": 0.35},
+                rule_filters=strategy["rule_filters"],
+                rf_mode="static", rf_model_static=_rf_bt,
+                rf_meta=_rf_meta_bt,
+                score_mode="stat_miss_penalty",
+                strategy_name="rf_stat",
+            )
+            _log_strategy_metrics(_r_rf)
+            all_results.append(_r_rf)
+        else:
+            logger.warning("rf_stat single: SKIP (RF not available)")
+
+        # C) random_3x5plus12 baseline
+        logger.info("--- random_3x5plus12 ({} trials) ---".format(_bt_trials))
+        _r_rand = run_random_3x5plus12_baseline(
+            data_asc, periods=_bt_periods,
+            n_trials=_bt_trials, rng_seed=42,
+        )
+        logger.info("  profit={:.0f} roi_t={:.4f} any3={:.4f}±{:.4f}".format(
+            _r_rand.get("total_profit", 0),
+            _r_rand.get("roi_truncated", 0),
+            _r_rand.get("any_group_hit3_or_more_rate", 0),
+            _r_rand.get("any_group_hit3_or_more_rate_std", 0),
+        ))
+        all_results.append(_r_rand)
+
+        # 保存
+        _all_records = []
+        for _r in all_results:
+            _all_records.extend(_r.get("records", []))
+        _bt_df = pd.DataFrame(_all_records)
+        _bt_csv = os.path.join("outputs", "n9_3x5plus12_backtest_detail.csv")
+        _bt_json = os.path.join("outputs", "n9_3x5plus12_backtest_detail.json")
+        out_dir = os.path.dirname(_bt_csv)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+        _bt_df.to_csv(_bt_csv, index=False, encoding="utf-8-sig")
+        with open(_bt_json, "w", encoding="utf-8") as f:
+            json.dump(_all_records, f, ensure_ascii=False, indent=2)
+        logger.info("明细已保存: {} / {}".format(_bt_csv, _bt_json))
+
+        # 汇总
+        _summary = []
+        for _r in all_results:
+            _s = {
+                "strategy_name": _r.get("strategy_name", "?"),
+                "periods": _r.get("periods", 0),
+                "total_cost": _r.get("total_cost", 0),
+                "total_reward": _r.get("total_reward", 0),
+                "total_profit": _r.get("total_profit", 0),
+                "roi": _r.get("roi", 0),
+                "roi_truncated": _r.get("roi_truncated", 0),
+                "any_group_hit3_or_more_rate": _r.get("any_group_hit3_or_more_rate",
+                                                      _r.get("hit3_or_more_rate", 0)),
+                "any_group_hit2_or_more_rate": _r.get("any_group_hit2_or_more_rate",
+                                                      _r.get("hit2_or_more_rate", 0)),
+                "max_drawdown": _r.get("max_drawdown", 0),
+                "max_consecutive_loss": _r.get("max_consecutive_loss", 0),
+                "rf_available_periods": _r.get("rf_available_periods", ""),
+                "rf_unavailable_periods": _r.get("rf_unavailable_periods", ""),
+            }
+            for _k in ["total_profit_std", "roi_std", "roi_truncated_std",
+                       "any_group_hit3_or_more_rate_std",
+                       "any_group_hit2_or_more_rate_std"]:
+                if _k in _r:
+                    _s[_k] = _r[_k]
+            _summary.append(_s)
+
+        _sum_csv = os.path.join("outputs", "n9_3x5plus12_backtest_summary.csv")
+        _sum_json = os.path.join("outputs", "n9_3x5plus12_backtest_summary.json")
+        pd.DataFrame(_summary).to_csv(_sum_csv, index=False, encoding="utf-8-sig")
+        with open(_sum_json, "w", encoding="utf-8") as f:
+            json.dump(_summary, f, ensure_ascii=False, indent=2)
+        logger.info("汇总已保存: {} / {}".format(_sum_csv, _sum_json))
+
+        # 摘要
+        logger.info("=" * 60)
+        logger.info("n9_3x5plus12 回测摘要 ({}期)".format(_bt_periods))
+        for _s in _summary:
+            _extra = ""
+            if "any_group_hit3_or_more_rate_std" in _s:
+                _extra = "±{:.4f}".format(_s["any_group_hit3_or_more_rate_std"])
+            logger.info("  {:>24s}: roi_t={:>8.4f}  any3={:.4f}{}  cost={}".format(
+                _s["strategy_name"], _s["roi_truncated"],
+                _s["any_group_hit3_or_more_rate"], _extra, _s["total_cost"]))
+
+        # random trial 文件
+        _rtm = _r_rand.get("_trial_metrics", [])
+        if _rtm:
+            _rt_csv = os.path.join("outputs", "n9_3x5plus12_random_trials.csv")
+            _rt_json = os.path.join("outputs", "n9_3x5plus12_random_trials.json")
+            pd.DataFrame(_rtm).to_csv(_rt_csv, index=False, encoding="utf-8-sig")
+            with open(_rt_json, "w", encoding="utf-8") as f:
+                json.dump(_rtm, f, ensure_ascii=False, indent=2)
+            logger.info("random trials 已保存: {} / {}".format(_rt_csv, _rt_json))
+
+        logger.info("回测完成")
         return
 
     if int(args.rolling_stability) == 1:
